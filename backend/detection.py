@@ -5,9 +5,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
 try:
-    from .config import is_in_maintenance_window, is_trusted_server
+    from .config import DEFAULT_SETTINGS, is_in_maintenance_window, is_trusted_server
 except ImportError:
-    from config import is_in_maintenance_window, is_trusted_server
+    from config import DEFAULT_SETTINGS, is_in_maintenance_window, is_trusted_server
 
 
 def match_approved_activity(
@@ -380,6 +380,20 @@ def detect_anomalies(
                 if cv <= cv_thresh and mean_delta >= 15.0:
                     rec_ids = pair_sorted["record_id"].tolist()
                     matched_app = match_approved_activity(host, dst, pair_sorted["dst_port"].dropna().astype(int).tolist(), approved_activities)
+                    connection_timeline = []
+                    previous_time = None
+                    for _, connection in pair_sorted.iterrows():
+                        connection_time = connection["timestamp"]
+                        gap_seconds = (
+                            (connection_time - previous_time).total_seconds()
+                            if previous_time is not None else None
+                        )
+                        connection_timeline.append({
+                            "record_id": connection["record_id"],
+                            "timestamp": str(connection_time),
+                            "gap_seconds": round(gap_seconds, 2) if gap_seconds is not None else None
+                        })
+                        previous_time = connection_time
 
                     findings.append({
                         "finding_id": f"FND-{finding_counter:04d}",
@@ -391,6 +405,14 @@ def detect_anomalies(
                         "time_window": f"{times[0]} to {times[-1]}",
                         "observed_value": f"Interval: {mean_delta:.1f}s +/- {std_delta:.2f}s (CV: {cv:.3f}, {len(pair_sorted)} connections)",
                         "baseline_threshold": f"CV <= {cv_thresh} (Strict periodicity)",
+                        "beaconing_metrics": {
+                            "mean_interval_seconds": round(float(mean_delta), 2),
+                            "standard_deviation_seconds": round(float(std_delta), 2),
+                            "coefficient_of_variation": round(float(cv), 4),
+                            "interval_count": len(valid_deltas),
+                            "threshold_cv": cv_thresh
+                        },
+                        "connection_timeline": connection_timeline,
                         "severity": "High",
                         "deviation_ratio": round(1.0 / max(cv, 0.01), 2),
                         "explanation": (
@@ -575,6 +597,8 @@ def detect_anomalies(
 
     trusted_roles = {server.get("ip"): server.get("role", "Trusted Server")
                      for server in config.get("trusted_servers", [])}
+    scoring_cfg = config.get("scoring", {})
+    trusted_multipliers = scoring_cfg.get("trusted_activity_multipliers", {})
     for finding in findings:
         supporting_rows = eval_df[eval_df["record_id"].isin(finding.get("supporting_record_ids", []))]
         suppression_reason = None
@@ -603,7 +627,20 @@ def detect_anomalies(
 
         finding["is_suppressed"] = suppression_reason is not None
         finding["suppression_reason"] = suppression_reason
-        finding["risk_score"] = calculate_incident_score([finding], config.get("scoring", {}))[0]
+        if suppression_reason and suppression_reason.startswith("Scheduled maintenance:"):
+            trusted_multiplier = float(trusted_multipliers.get("maintenance", 0.0))
+        elif suppression_reason and finding.get("is_approved_activity"):
+            trusted_multiplier = float(trusted_multipliers.get("approved_activity", 0.0))
+        elif trusted_roles:
+            trusted_multiplier = float(trusted_multipliers.get("trusted_server", 0.8))
+        else:
+            trusted_multiplier = 1.0
+        finding["trusted_activity_adjustment_multiplier"] = min(1.0, max(0.0, trusted_multiplier))
+        rule_weights = scoring_cfg.get("rule_weights", DEFAULT_SETTINGS["scoring"]["rule_weights"])
+        finding["rule_weight"] = float(rule_weights.get(
+            finding.get("rule_id"), scoring_cfg.get("default_rule_weight", 50)
+        ))
+        finding["risk_score"] = calculate_incident_score([finding], scoring_cfg)[0]
 
     return findings
 
@@ -613,75 +650,144 @@ def calculate_incident_score(
     scoring_cfg: Dict[str, Any]
 ) -> Tuple[int, str, Dict[str, float]]:
     """
-    Computes deterministic investigation priority risk score (0-100)
-    using documented formula:
-    Score = w_sev * S_sev + w_dev * S_dev + w_pers * S_pers + w_cat * S_cat
+    Computes a deterministic, configurable incident risk score from its findings.
     """
-    weights = scoring_cfg.get("weights", {
-        "severity": 0.35,
-        "deviation": 0.25,
-        "persistence": 0.20,
-        "category_diversity": 0.20
-    })
-    w_sev = float(weights.get("severity", 0.35))
-    w_dev = float(weights.get("deviation", 0.25))
-    w_pers = float(weights.get("persistence", 0.20))
-    w_cat = float(weights.get("category_diversity", 0.20))
-
-    base_pts = scoring_cfg.get("severity_base_points", {
-        "Low": 20,
-        "Medium": 45,
-        "High": 75,
-        "Critical": 95
-    })
+    defaults = DEFAULT_SETTINGS["scoring"]
+    default_weights = defaults["weights"]
+    configured_weights = scoring_cfg.get("weights", default_weights)
+    weights = {
+        key: float(configured_weights.get(key, default_weights[key]))
+        for key in default_weights
+    }
+    base_points = scoring_cfg.get("severity_base_points", defaults["severity_base_points"])
+    rule_weights = scoring_cfg.get("rule_weights", defaults["rule_weights"])
 
     # 1. Severity Factor: maximum severity among constituent findings
     severities = [f.get("severity", "Medium") for f in findings]
-    sev_values = [base_pts.get(s, 45) for s in severities]
-    s_sev = max(sev_values) if sev_values else 20.0
+    severity_values = [
+        float(base_points.get(severity, base_points.get("Medium", defaults["severity_base_points"]["Medium"])))
+        for severity in severities
+    ]
+    severity_score = max(severity_values) if severity_values else float(base_points.get("Low", defaults["severity_base_points"]["Low"]))
 
-    # 2. Deviation Factor: based on maximum deviation ratio
+    # 2. Deviation Factor: normalized from the largest observed rule deviation.
     ratios = [f.get("deviation_ratio", 1.0) for f in findings]
     max_ratio = max(ratios) if ratios else 1.0
-    # Map ratio: 1.0 -> 30, 2.0 -> 50, 3.0 -> 70, 5.0+ -> 100
-    s_dev = min(100.0, max(20.0, 30.0 + (max_ratio - 1.0) * 17.5))
+    deviation_base = float(scoring_cfg.get("deviation_base_points", defaults["deviation_base_points"]))
+    deviation_step = float(scoring_cfg.get("deviation_points_per_ratio", defaults["deviation_points_per_ratio"]))
+    deviation_saturation = float(scoring_cfg.get("deviation_saturation_ratio", defaults["deviation_saturation_ratio"]))
+    deviation_ratio = min(max_ratio, max(1.0, deviation_saturation))
+    deviation_score = min(100.0, max(0.0, deviation_base + (deviation_ratio - 1.0) * deviation_step))
 
-    # 3. Persistence Factor: total number of supporting flows across findings
-    all_rec_ids = set()
-    for f in findings:
-        all_rec_ids.update(f.get("supporting_record_ids", []))
-    n_records = len(all_rec_ids)
-    s_pers = min(100.0, 25.0 + math.log(max(n_records, 1) + 1, 2) * 15.0)
+    # 3. Persistence Factor: distinct supporting flow evidence.
+    all_record_ids = {
+        record_id
+        for finding in findings
+        for record_id in finding.get("supporting_record_ids", [])
+    }
+    record_count = len(all_record_ids)
+    persistence_base = float(scoring_cfg.get("persistence_base_points", defaults["persistence_base_points"]))
+    persistence_step = float(scoring_cfg.get("persistence_points_per_log2_record", defaults["persistence_points_per_log2_record"]))
+    persistence_saturation = max(1, int(scoring_cfg.get(
+        "persistence_saturation_records", defaults["persistence_saturation_records"]
+    )))
+    scored_record_count = min(record_count, persistence_saturation)
+    persistence_score = min(
+        100.0,
+        max(0.0, persistence_base + math.log2(max(scored_record_count, 1) + 1) * persistence_step)
+    )
 
-    # 4. Category Diversity Factor: distinct detection rules triggered
-    distinct_rules = len(set(f.get("rule_id") for f in findings))
-    if distinct_rules == 1:
-        s_cat = 35.0
-    elif distinct_rules == 2:
-        s_cat = 70.0
-    else:
-        s_cat = 100.0
+    rule_ids = sorted({finding.get("rule_id", "UNKNOWN") for finding in findings})
+    rule_names = {
+        finding.get("rule_id", "UNKNOWN"): finding.get("rule_name", finding.get("rule_id", "Unknown rule"))
+        for finding in findings
+    }
+    category_points = scoring_cfg.get("category_diversity_points", defaults["category_diversity_points"])
+    category_key = str(len(rule_ids))
+    category_score = float(category_points.get(
+        category_key,
+        scoring_cfg.get("category_diversity_max_points", defaults["category_diversity_max_points"]) if rule_ids else 0
+    ))
 
-    raw_score = (w_sev * s_sev) + (w_dev * s_dev) + (w_pers * s_pers) + (w_cat * s_cat)
-    final_score = int(round(min(100.0, max(0.0, raw_score))))
+    # Rule priority is an average across distinct triggered rules, not finding count.
+    rule_priority_values = {
+        rule_id: float(rule_weights.get(rule_id, scoring_cfg.get("default_rule_weight", defaults["default_rule_weight"])))
+        for rule_id in rule_ids
+    }
+    rule_priority_score = (
+        sum(rule_priority_values.values()) / len(rule_priority_values)
+        if rule_priority_values else 0.0
+    )
+
+    # Corroboration grows with multiple findings and saturates at the configured value.
+    correlation_step = float(scoring_cfg.get(
+        "correlation_points_per_additional_finding",
+        defaults["correlation_points_per_additional_finding"]
+    ))
+    correlation_score = min(
+        100.0,
+        max(0, len(findings) - 1) * correlation_step
+    )
+
+    component_scores = {
+        "severity": severity_score,
+        "deviation": deviation_score,
+        "persistence": persistence_score,
+        "category_diversity": category_score,
+        "rule_priority": rule_priority_score,
+        "correlation": correlation_score
+    }
+    component_points = {
+        key: component_scores[key] * weights[key]
+        for key in weights
+    }
+    pre_adjustment_score = sum(component_points.values())
+    trusted_defaults = defaults["trusted_activity_multipliers"]
+    finding_multipliers = []
+    for finding in findings:
+        if "trusted_activity_adjustment_multiplier" in finding:
+            finding_multipliers.append(float(finding["trusted_activity_adjustment_multiplier"]))
+        elif finding.get("is_approved_activity"):
+            finding_multipliers.append(float(trusted_defaults["approved_activity"]))
+        else:
+            finding_multipliers.append(1.0)
+    trusted_multiplier = min(finding_multipliers, default=1.0)
+    trusted_multiplier = min(1.0, max(0.0, trusted_multiplier))
+    final_score = int(round(min(100.0, max(0.0, pre_adjustment_score * trusted_multiplier))))
+
+    rule_contributions = []
+    for rule_id in rule_ids:
+        weighted_points = (
+            rule_priority_values[rule_id]
+            * weights["rule_priority"]
+            / len(rule_ids)
+            * trusted_multiplier
+        )
+        rule_contributions.append({
+            "rule_id": rule_id,
+            "rule_name": rule_names[rule_id],
+            "configured_weight": rule_priority_values[rule_id],
+            "finding_count": sum(finding.get("rule_id") == rule_id for finding in findings),
+            "weighted_points": round(weighted_points, 2)
+        })
 
     breakdown = {
-        "severity_score": round(s_sev, 1),
-        "severity_weight": w_sev,
-        "deviation_score": round(s_dev, 1),
-        "deviation_weight": w_dev,
-        "persistence_score": round(s_pers, 1),
-        "persistence_weight": w_pers,
-        "category_score": round(s_cat, 1),
-        "category_weight": w_cat,
-        "raw_weighted_total": round(raw_score, 1)
+        **{f"{key}_score": round(value, 1) for key, value in component_scores.items()},
+        **{f"{key}_weight": value for key, value in weights.items()},
+        "component_points": {key: round(value, 2) for key, value in component_points.items()},
+        "raw_weighted_total": round(pre_adjustment_score, 2),
+        "trusted_activity_multiplier": round(trusted_multiplier, 3),
+        "trusted_activity_adjustment_points": round(pre_adjustment_score * (1.0 - trusted_multiplier), 2),
+        "supporting_record_count": record_count,
+        "scored_supporting_record_count": scored_record_count,
+        "distinct_rule_count": len(rule_ids),
+        "rule_contributions": rule_contributions
     }
 
     explanation = (
-        f"Score {final_score}/100: Calculated from max severity points ({s_sev:.0f} pts * {w_sev:.2f}) + "
-        f"statistical deviation ({s_dev:.0f} pts * {w_dev:.2f}) + "
-        f"persistence ({s_pers:.0f} pts * {w_pers:.2f}, {n_records} flows) + "
-        f"category diversity ({s_cat:.0f} pts * {w_cat:.2f}, {distinct_rules} rule(s))."
+        f"Score {final_score}/100 from configured severity, deviation, evidence persistence, "
+        f"rule diversity, rule priority, and correlation weights; "
+        f"trusted-activity multiplier {trusted_multiplier:.2f} applied to {pre_adjustment_score:.2f} raw points."
     )
 
     return final_score, explanation, breakdown
@@ -731,6 +837,17 @@ def group_findings_into_incidents(
 
     incidents: List[Dict[str, Any]] = []
     inc_counter = 1
+    attack_stages = {
+        "RULE_UNEXPECTED_COMM": "Initial Access / Reconnaissance",
+        "RULE_PORT_PROBE": "Discovery",
+        "RULE_NETWORK_SWEEP": "Discovery",
+        "RULE_DEST_DIVERSITY": "Discovery",
+        "RULE_LATERAL_MOVEMENT": "Lateral Movement",
+        "RULE_BEACONING": "Command and Control",
+        "RULE_DNS_ANOMALY": "Command and Control",
+        "RULE_DATA_TRANSFER": "Exfiltration",
+        "RULE_BLOCKED_CONNS": "Credential Access / Impact"
+    }
 
     for host, host_findings in host_groups.items():
         # Within each host, check if findings share destination or are temporally grouped
@@ -779,18 +896,25 @@ def group_findings_into_incidents(
             "first_seen": first_seen,
             "last_seen": last_seen,
             "related_rules": sorted(list(all_rules)),
+            "contributing_rules": breakdown["rule_contributions"],
             "findings_count": len(host_findings),
             "findings": host_findings,
             "timeline": [
                 {
                     "timestamp": finding.get("timestamp"),
                     "finding_id": finding.get("finding_id"),
+                    "rule_id": finding.get("rule_id"),
                     "rule_name": finding.get("rule_name"),
+                    "attack_stage": attack_stages.get(finding.get("rule_id"), "Behavioral Anomaly"),
                     "severity": finding.get("severity"),
                     "explanation": finding.get("explanation")
                 }
                 for finding in sorted(host_findings, key=lambda item: item.get("timestamp", ""))
             ],
+            "attack_stages": list(dict.fromkeys(
+                attack_stages.get(finding.get("rule_id"), "Behavioral Anomaly")
+                for finding in sorted(host_findings, key=lambda item: item.get("timestamp", ""))
+            )),
             "supporting_record_ids": sorted(list(all_rec_ids)),
             "severity": severity,
             "score": score,

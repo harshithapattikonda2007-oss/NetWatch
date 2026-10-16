@@ -187,6 +187,15 @@ def test_uploaded_custom_dataset_populates_dashboard_analysis(client):
     assert dashboard["severity_score_thresholds"] == load_settings()["scoring"]["score_thresholds"]
     assert sum(dashboard["severity_distribution"].values()) == dashboard["total_incidents"]
     assert dashboard["top_ports"][0]["port"] == 9443
+    host_comparison = client.get("/api/analytics/host/203.0.113.10").json()["behavior_comparison"]
+    assert host_comparison["learning_window"]
+    assert host_comparison["evaluation_window"]
+    assert {metric["key"] for metric in host_comparison["metrics"]} >= {
+        "connections_per_hour", "bytes_sent_per_hour", "failed_rate"
+    }
+    traffic = client.get("/api/analytics/traffic?interval=5").json()
+    assert traffic["anomaly_markers"]
+    assert sum(bucket["anomaly_count"] for bucket in traffic["time_series"]) > 0
     preview = client.get("/api/dataset/preview").json()
     assert preview["dataset_name"] == "custom_flows.csv"
     assert preview["quality_summary"]["valid_records"] == 24
@@ -464,6 +473,54 @@ def test_analytics_include_destination_hosts_dns_flows_and_nonempty_buckets():
     assert graph["summary"]["incident_edges"] == 1
 
 
+def test_beacon_timeline_and_approved_periodic_false_positive():
+    cfg = load_settings()
+    for rule_name, rule_cfg in cfg["rules"].items():
+        rule_cfg["enabled"] = rule_name == "periodic_connections"
+    cfg["rules"]["periodic_connections"]["min_occurrences"] = 5
+    start = datetime(2026, 10, 5, 10, 0)
+    rows = []
+    record_id = 1
+    hosts = [
+        ("203.0.113.80", "198.51.100.44", 8443),
+        ("192.168.1.180", "192.168.1.50", 514)
+    ]
+    for source, destination, port in hosts:
+        for index in range(6):
+            rows.append({
+                "record_id": record_id,
+                "timestamp": start + timedelta(seconds=index * 60),
+                "src_ip": source,
+                "dst_ip": destination,
+                "src_port": 50000 + record_id,
+                "dst_port": port,
+                "protocol": "TCP",
+                "bytes_sent": 500,
+                "bytes_received": 100,
+                "packets": 4,
+                "duration": 0.5,
+                "action": "ALLOW",
+                "dns_query": "",
+                "label": ""
+            })
+            record_id += 1
+
+    findings = detect_anomalies(
+        pd.DataFrame(rows), {"host_baselines": {}, "all_observed_pairs": []}, cfg
+    )
+    suspicious = next(finding for finding in findings if finding["affected_host"] == "203.0.113.80")
+    approved = next(finding for finding in findings if finding["affected_host"] == "192.168.1.180")
+    assert suspicious["rule_id"] == "RULE_BEACONING"
+    assert suspicious["is_suppressed"] is False
+    assert suspicious["beaconing_metrics"]["coefficient_of_variation"] == 0
+    assert [item["gap_seconds"] for item in suspicious["connection_timeline"]] == [None, 60, 60, 60, 60, 60]
+    assert approved["is_suppressed"] is True
+    assert approved["approved_activity_name"] == "Nightly Log Aggregation Agent"
+    incidents = group_findings_into_incidents(findings, cfg)
+    assert [incident["affected_hosts"] for incident in incidents] == [["203.0.113.80"]]
+    assert incidents[0]["timeline"][0]["attack_stage"] == "Command and Control"
+
+
 def test_sweep_lateral_detection_and_legitimate_activity_suppression():
     cfg = load_settings()
     cfg["rules"]["port_probing"]["enabled"] = False
@@ -577,6 +634,87 @@ def test_incident_grouping_and_scoring():
     assert 0 <= inc["score"] <= 100
     assert "deterministic" in inc["score_explanation"].lower() or "score" in inc["score_explanation"].lower()
     assert inc["severity"] in ["High", "Critical"]
+    assert len(inc["contributing_rules"]) == 2
+    assert inc["score_breakdown"]["correlation_score"] > 0
+    assert abs(
+        sum(rule["weighted_points"] for rule in inc["contributing_rules"])
+        - inc["score_breakdown"]["component_points"]["rule_priority"]
+    ) < 0.02
+
+
+def test_incident_score_uses_configured_rule_and_trusted_activity_weights():
+    scoring = load_settings()["scoring"]
+    findings = [{
+        "rule_id": "RULE_PORT_PROBE",
+        "rule_name": "Port Probing",
+        "severity": "High",
+        "deviation_ratio": 2.0,
+        "supporting_record_ids": [1, 2],
+    }]
+    baseline_score, _, baseline_breakdown = calculate_incident_score(findings, scoring)
+
+    correlated = findings + [{
+        "rule_id": "RULE_BLOCKED_CONNS",
+        "rule_name": "Blocked Connections",
+        "severity": "High",
+        "deviation_ratio": 2.5,
+        "supporting_record_ids": [3, 4],
+    }]
+    correlated_score, _, correlated_breakdown = calculate_incident_score(correlated, scoring)
+    assert correlated_score > baseline_score
+    assert correlated_breakdown["correlation_score"] > baseline_breakdown["correlation_score"]
+    assert {rule["rule_id"] for rule in correlated_breakdown["rule_contributions"]} == {
+        "RULE_PORT_PROBE", "RULE_BLOCKED_CONNS"
+    }
+
+    adjusted = [dict(correlated[0], trusted_activity_adjustment_multiplier=0.5)] + correlated[1:]
+    adjusted_score, _, adjusted_breakdown = calculate_incident_score(adjusted, scoring)
+    assert adjusted_breakdown["trusted_activity_multiplier"] == 0.5
+    assert adjusted_score == round(adjusted_breakdown["raw_weighted_total"] * 0.5)
+
+
+def test_incident_severity_score_boundaries():
+    thresholds = load_settings()["scoring"]["score_thresholds"]
+    expected = {
+        0: "Low", 35: "Low", 36: "Medium", 65: "Medium",
+        66: "High", 85: "High", 86: "Critical", 100: "Critical"
+    }
+    assert {score: get_incident_severity(score, thresholds) for score in expected} == expected
+
+
+def test_qualcomm_analysis_returns_verified_results_when_runtime_is_pending(client, monkeypatch):
+    monkeypatch.delenv("QUALCOMM_GENIEX_BASE_URL", raising=False)
+    monkeypatch.delenv("QUALCOMM_GENIEX_API_KEY", raising=False)
+    assert client.post("/api/sample/load").status_code == 200
+    incidents = client.get("/api/incidents").json()["incidents"]
+    assert incidents
+    incident = incidents[0]
+
+    response = client.get(f"/api/incidents/{incident['incident_id']}/qualcomm-analysis")
+    assert response.status_code == 200
+    result = response.json()
+    assert result["provider"] == "Qualcomm AI Hub / GenieX"
+    assert result["integration_status"] == "pending"
+    assert result["model"] == "ai-hub-models/Qwen3-4B-Instruct-2507"
+    assert result["ai_assessment"] is None
+    assert result["model_confidence"] is None
+    assert result["verified_analysis"]["risk_assessment"]["score"] == incident["score"]
+    assert result["verified_analysis"]["validation"]["checks"]["overall"] == "verified"
+    assert result["verified_analysis"]["evidence"]["returned_record_count"] > 0
+
+    response = client.post(f"/api/incidents/{incident['incident_id']}/qualcomm-analysis")
+    assert response.status_code == 200
+    assert response.json()["ai_assessment"] is None
+
+
+def test_qualcomm_rejects_remote_runtime_urls(client, monkeypatch):
+    monkeypatch.setenv("QUALCOMM_GENIEX_BASE_URL", "https://example.com/v1")
+    assert client.post("/api/sample/load").status_code == 200
+    incident = client.get("/api/incidents").json()["incidents"][0]
+    result = client.get(f"/api/incidents/{incident['incident_id']}/qualcomm-analysis").json()
+    assert result["integration_status"] == "unavailable"
+    assert "loopback" in result["status_message"]
+    assert result["ai_assessment"] is None
 
 
 # -----------------------------------------------------------------------------
@@ -615,6 +753,10 @@ def test_api_sample_load_and_workflow(client):
     assert loaded_dashboard["total_findings"] == data["auto_analysis"]["total_findings"]
     assert loaded_dashboard["total_incidents"] == data["auto_analysis"]["total_incidents"]
     assert sum(loaded_dashboard["severity_distribution"].values()) == loaded_dashboard["total_incidents"]
+    traffic_result = client.get("/api/analytics/traffic?interval=5").json()
+    assert traffic_result["anomaly_markers"]
+    assert any(marker["is_suppressed"] for marker in traffic_result["anomaly_markers"])
+    assert any(bucket["anomaly_count"] > 0 for bucket in traffic_result["time_series"])
 
     # 3. Get time range
     res = client.get("/api/dataset/time-range")
@@ -674,10 +816,21 @@ def test_api_sample_load_and_workflow(client):
 
     res = client.get(f"/api/incidents/{first_inc_id}")
     assert res.status_code == 200
+    incident_detail = res.json()
+    assert incident_detail["timeline"]
+    assert all(event.get("attack_stage") for event in incident_detail["timeline"])
+    assert incident_detail["attack_stages"]
 
     res = client.get(f"/api/incidents/{first_inc_id}/evidence")
     assert res.status_code == 200
     assert len(res.json()["records"]) > 0
+
+    res = client.get(f"/api/incidents/{first_inc_id}/graph")
+    assert res.status_code == 200
+    assert res.json()["incident_id"] == first_inc_id
+    assert len(res.json()["elements"]["nodes"]) > 0
+    assert len(res.json()["elements"]["edges"]) > 0
+    assert res.json()["summary"]["incident_edges"] > 0
 
     # 10. AI / Rule explanation
     res = client.post(f"/api/incidents/{first_inc_id}/ai-explain")

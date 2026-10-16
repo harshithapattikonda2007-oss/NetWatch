@@ -2,8 +2,10 @@ import io
 import os
 import csv
 import html
+import json
 import httpx
 import pandas as pd
+from urllib.parse import urlsplit
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response
@@ -569,12 +571,42 @@ def get_traffic_analytics(interval: int = Query(5, description="Interval in minu
     traffic = get_traffic_over_time(state.clean_df, interval_minutes=interval)
     protocols = get_protocol_distribution(state.clean_df)
     talkers = get_top_talkers(state.clean_df, limit=10)
+    bucket_findings: Dict[str, List[Dict[str, Any]]] = {}
+    for finding in state.findings:
+        try:
+            bucket_time = pd.to_datetime(finding["timestamp"]).floor(f"{interval}min")
+        except (KeyError, TypeError, ValueError):
+            continue
+        bucket_key = str(bucket_time)
+        bucket_findings.setdefault(bucket_key, []).append(finding)
+
+    for bucket in traffic:
+        matching_findings = bucket_findings.get(bucket["timestamp"], [])
+        bucket["anomaly_count"] = sum(not finding.get("is_suppressed", False) for finding in matching_findings)
+        bucket["approved_activity_count"] = sum(finding.get("is_suppressed", False) for finding in matching_findings)
+        bucket["anomaly_rules"] = sorted({finding.get("rule_name", "Anomaly") for finding in matching_findings})
 
     return {
         "interval_minutes": interval,
         "time_series": traffic,
         "protocols": protocols,
-        "top_talkers": talkers
+        "top_talkers": talkers,
+        "anomaly_markers": [
+            {
+                "timestamp": finding.get("timestamp"),
+                "finding_id": finding.get("finding_id"),
+                "rule_id": finding.get("rule_id"),
+                "rule_name": finding.get("rule_name"),
+                "affected_host": finding.get("affected_host"),
+                "observed_value": finding.get("observed_value"),
+                "baseline_threshold": finding.get("baseline_threshold"),
+                "explanation": finding.get("explanation"),
+                "risk_score": finding.get("risk_score"),
+                "is_suppressed": finding.get("is_suppressed", False),
+                "suppression_reason": finding.get("suppression_reason")
+            }
+            for finding in state.findings
+        ]
     }
 
 
@@ -592,7 +624,15 @@ def get_individual_host_analysis(host_ip: str):
     if state.clean_df is None or state.clean_df.empty:
         raise HTTPException(status_code=400, detail="No dataset loaded")
 
-    result = get_host_analysis(state.clean_df, host_ip, state.baseline, state.incidents)
+    observed_df = state.clean_df
+    if state.eval_start and state.eval_end:
+        observed_df = state.clean_df[
+            (state.clean_df["timestamp"] >= pd.to_datetime(state.eval_start))
+            & (state.clean_df["timestamp"] <= pd.to_datetime(state.eval_end))
+        ].copy()
+    result = get_host_analysis(
+        state.clean_df, host_ip, state.baseline, state.incidents, observed_df
+    )
     return result
 
 
@@ -671,6 +711,20 @@ def get_incident_evidence(incident_id: str):
     }
 
 
+@app.get("/api/incidents/{incident_id}/graph")
+def get_incident_graph(incident_id: str):
+    incident = next((item for item in state.incidents if item["incident_id"] == incident_id), None)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    if state.clean_df is None or state.clean_df.empty:
+        return {"incident_id": incident_id, "elements": {"nodes": [], "edges": []}, "summary": {}}
+
+    evidence_ids = set(incident.get("supporting_record_ids", []))
+    evidence_df = state.clean_df[state.clean_df["record_id"].isin(evidence_ids)].copy()
+    graph = build_network_graph(evidence_df, [incident], max_edges=max(len(evidence_df), 1))
+    return {"incident_id": incident_id, **graph}
+
+
 @app.get("/api/findings")
 def get_findings_list(host: Optional[str] = Query(None)):
     if host:
@@ -689,6 +743,209 @@ def update_configuration(new_settings: Dict[str, Any]):
     if not success:
         raise HTTPException(status_code=400, detail=msg)
     return {"success": True, "message": msg, "settings": new_settings}
+
+
+QUALCOMM_DEFAULT_MODEL = "ai-hub-models/Qwen3-4B-Instruct-2507"
+
+
+def _qualcomm_runtime_settings() -> Dict[str, str]:
+    return {
+        "base_url": os.getenv("QUALCOMM_GENIEX_BASE_URL", "").strip().rstrip("/"),
+        "model": os.getenv("QUALCOMM_GENIEX_MODEL", QUALCOMM_DEFAULT_MODEL).strip(),
+        "api_key": os.getenv("QUALCOMM_GENIEX_API_KEY", "").strip()
+    }
+
+
+def _verified_incident_analysis(incident: Dict[str, Any]) -> Dict[str, Any]:
+    findings = incident.get("findings", [])
+    expected_record_ids = set(incident.get("supporting_record_ids", []))
+    if state.clean_df is None:
+        evidence_df = pd.DataFrame()
+    else:
+        evidence_df = state.clean_df[state.clean_df["record_id"].isin(expected_record_ids)].copy()
+
+    found_record_ids = set(evidence_df["record_id"].tolist()) if not evidence_df.empty else set()
+    evidence_rows = evidence_df.head(50).to_dict(orient="records")
+    for row in evidence_rows:
+        if pd.notna(row.get("timestamp")):
+            row["timestamp"] = str(row["timestamp"])
+
+    breakdown = incident.get("score_breakdown", {})
+    component_points = breakdown.get("component_points", {})
+    raw_points = sum(float(value) for value in component_points.values())
+    trust_multiplier = float(breakdown.get("trusted_activity_multiplier", 1.0))
+    recomputed_score = int(round(min(100.0, max(0.0, raw_points * trust_multiplier))))
+    finding_rule_ids = {finding.get("rule_id") for finding in findings}
+    contributing_rule_ids = {
+        rule.get("rule_id") for rule in incident.get("contributing_rules", [])
+    }
+    related_hosts = set(incident.get("affected_hosts", []))
+    suppressed_host_findings = [
+        finding for finding in state.findings
+        if finding.get("affected_host") in related_hosts and finding.get("is_suppressed")
+    ]
+
+    checks = {
+        "risk_score_matches_breakdown": recomputed_score == incident.get("score"),
+        "supporting_records_present": expected_record_ids.issubset(found_record_ids),
+        "contributing_rules_have_findings": contributing_rule_ids.issubset(finding_rule_ids)
+    }
+    checks["overall"] = "verified" if all(checks.values()) else "review_required"
+
+    return {
+        "incident_id": incident["incident_id"],
+        "risk_assessment": {
+            "score": incident.get("score"),
+            "severity": incident.get("severity"),
+            "explanation": incident.get("score_explanation"),
+            "score_breakdown": breakdown,
+            "contributing_rules": incident.get("contributing_rules", [])
+        },
+        "triggered_rules": [
+            {
+                "finding_id": finding.get("finding_id"),
+                "rule_id": finding.get("rule_id"),
+                "rule_name": finding.get("rule_name"),
+                "severity": finding.get("severity"),
+                "observed_value": finding.get("observed_value"),
+                "baseline_threshold": finding.get("baseline_threshold"),
+                "explanation": finding.get("explanation"),
+                "supporting_record_ids": finding.get("supporting_record_ids", [])
+            }
+            for finding in findings
+        ],
+        "evidence": {
+            "expected_record_count": len(expected_record_ids),
+            "returned_record_count": len(found_record_ids),
+            "records": evidence_rows
+        },
+        "validation": {
+            "checks": checks,
+            "suppressed_activity_for_affected_hosts": [
+                {
+                    "finding_id": finding.get("finding_id"),
+                    "rule_name": finding.get("rule_name"),
+                    "reason": finding.get("suppression_reason")
+                }
+                for finding in suppressed_host_findings
+            ],
+            "summary": (
+                "Risk score, rules, and evidence were cross-checked against the active dataset."
+                if checks["overall"] == "verified"
+                else "One or more verification checks did not reconcile with the active dataset."
+            )
+        }
+    }
+
+
+async def _qualcomm_runtime_status(runtime: Dict[str, str]) -> Dict[str, str]:
+    base_url = runtime["base_url"]
+    if not base_url:
+        return {"status": "pending", "message": "GenieX is not configured. Verified NetWatch results are available below."}
+
+    parsed_url = urlsplit(base_url)
+    if (
+        parsed_url.scheme != "http"
+        or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        return {"status": "unavailable", "message": "Only a loopback GenieX server is supported; remote inference endpoints are disabled."}
+
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{base_url}/models")
+        response.raise_for_status()
+        available_models = {
+            item.get("id") for item in response.json().get("data", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        if available_models and runtime["model"] not in available_models:
+            return {"status": "unavailable", "message": f"GenieX is running but model {runtime['model']} is not loaded."}
+        return {"status": "available", "message": "Local GenieX runtime and configured model are available."}
+    except Exception:
+        return {"status": "unavailable", "message": "Could not connect to the configured local GenieX runtime."}
+
+
+def _qualcomm_response(incident: Dict[str, Any], runtime_status: Dict[str, str], runtime: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        "provider": "Qualcomm AI Hub / GenieX",
+        "model": runtime["model"],
+        "integration_status": runtime_status["status"],
+        "status_message": runtime_status["message"],
+        "ai_assessment": None,
+        "model_confidence": None,
+        "confidence_note": "GenieX chat responses do not provide a calibrated confidence score.",
+        "verified_analysis": _verified_incident_analysis(incident)
+    }
+
+
+@app.get("/api/incidents/{incident_id}/qualcomm-analysis")
+async def get_qualcomm_incident_analysis(incident_id: str):
+    incident = next((item for item in state.incidents if item["incident_id"] == incident_id), None)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    runtime = _qualcomm_runtime_settings()
+    status = await _qualcomm_runtime_status(runtime)
+    return _qualcomm_response(incident, status, runtime)
+
+
+@app.post("/api/incidents/{incident_id}/qualcomm-analysis")
+async def run_qualcomm_incident_analysis(incident_id: str):
+    incident = next((item for item in state.incidents if item["incident_id"] == incident_id), None)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    runtime = _qualcomm_runtime_settings()
+    status = await _qualcomm_runtime_status(runtime)
+    result = _qualcomm_response(incident, status, runtime)
+    if status["status"] != "available":
+        return result
+
+    verified = result["verified_analysis"]
+    evidence_facts = {
+        "risk_assessment": verified["risk_assessment"],
+        "triggered_rules": verified["triggered_rules"],
+        "supporting_flow_records": verified["evidence"]["records"][:20],
+        "deterministic_validation": verified["validation"]["checks"]
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Assist a network security analyst using only the supplied verified NetWatch evidence. "
+                "Distinguish observed facts from hypotheses, discuss plausible false-positive explanations, "
+                "and recommend validation steps. Never change the deterministic risk score or claim confidence."
+            )
+        },
+        {"role": "user", "content": json.dumps(evidence_facts, default=str)}
+    ]
+    headers = {}
+    if runtime["api_key"]:
+        headers["Authorization"] = f"Bearer {runtime['api_key']}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                f"{runtime['base_url']}/chat/completions",
+                headers=headers,
+                json={
+                    "model": runtime["model"],
+                    "messages": messages,
+                    "max_tokens": 700,
+                    "temperature": 0.2,
+                    "stream": False,
+                    "enable_think": False
+                }
+            )
+        response.raise_for_status()
+        assessment = response.json().get("choices", [{}])[0].get("message", {}).get("content")
+        if not isinstance(assessment, str) or not assessment.strip():
+            raise ValueError("GenieX returned no assessment text")
+        result["ai_assessment"] = assessment.strip()
+        result["status_message"] = "Assessment generated by the configured local GenieX runtime."
+    except Exception:
+        result["integration_status"] = "unavailable"
+        result["status_message"] = "The GenieX request failed; verified NetWatch results remain available."
+    return result
 
 
 # -----------------------------------------------------------------------------

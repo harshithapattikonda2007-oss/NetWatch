@@ -84,10 +84,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     },
     "scoring": {
         "weights": {
-            "severity": 0.35,
-            "deviation": 0.25,
-            "persistence": 0.20,
-            "category_diversity": 0.20
+            "severity": 0.30,
+            "deviation": 0.20,
+            "persistence": 0.15,
+            "category_diversity": 0.15,
+            "rule_priority": 0.10,
+            "correlation": 0.10
         },
         "severity_base_points": {
             "Low": 20,
@@ -100,6 +102,32 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "Medium": 65,
             "High": 85,
             "Critical": 100
+        },
+        "rule_weights": {
+            "RULE_DATA_TRANSFER": 85,
+            "RULE_PORT_PROBE": 75,
+            "RULE_NETWORK_SWEEP": 80,
+            "RULE_DEST_DIVERSITY": 55,
+            "RULE_LATERAL_MOVEMENT": 90,
+            "RULE_BEACONING": 90,
+            "RULE_UNEXPECTED_COMM": 60,
+            "RULE_DNS_ANOMALY": 80,
+            "RULE_BLOCKED_CONNS": 50
+        },
+        "default_rule_weight": 50,
+        "category_diversity_points": {"0": 0, "1": 35, "2": 70, "3": 100},
+        "category_diversity_max_points": 100,
+        "deviation_saturation_ratio": 5.0,
+        "deviation_base_points": 30.0,
+        "deviation_points_per_ratio": 17.5,
+        "persistence_saturation_records": 20,
+        "persistence_base_points": 25.0,
+        "persistence_points_per_log2_record": 15.0,
+        "correlation_points_per_additional_finding": 55,
+        "trusted_activity_multipliers": {
+            "approved_activity": 0.0,
+            "maintenance": 0.0,
+            "trusted_server": 0.8
         }
     },
     "upload": {
@@ -185,9 +213,41 @@ def validate_settings(settings: Dict[str, Any]) -> tuple:
     # Validate scoring weights sum to roughly 1.0
     if "scoring" in settings and "weights" in settings["scoring"]:
         weights = settings["scoring"]["weights"]
-        total = sum(float(w) for w in weights.values())
+        try:
+            weight_values = [float(weight) for weight in weights.values()]
+        except (TypeError, ValueError):
+            return False, "Scoring weights must be numeric"
+        if any(weight < 0 or weight > 1 for weight in weight_values):
+            return False, "Scoring weights must be between 0 and 1"
+        total = sum(weight_values)
         if abs(total - 1.0) > 0.05:
             return False, f"Scoring weights must sum to 1.0 (current sum: {total:.2f})"
+
+    if "scoring" in settings:
+        scoring = settings["scoring"]
+        for section in ("rule_weights", "severity_base_points"):
+            values = scoring.get(section, {})
+            try:
+                numeric_values = [float(value) for value in values.values()]
+            except (TypeError, ValueError):
+                return False, f"Scoring {section} must contain numeric values"
+            if any(value < 0 or value > 100 for value in numeric_values):
+                return False, f"Scoring {section} values must be between 0 and 100"
+
+        multipliers = scoring.get("trusted_activity_multipliers", {})
+        try:
+            multiplier_values = [float(value) for value in multipliers.values()]
+        except (TypeError, ValueError):
+            return False, "Trusted activity multipliers must be numeric"
+        if any(value < 0 or value > 1 for value in multiplier_values):
+            return False, "Trusted activity multipliers must be between 0 and 1"
+
+        thresholds = scoring.get("score_thresholds", {})
+        threshold_order = [thresholds.get(key) for key in ("Low", "Medium", "High", "Critical")]
+        if any(not isinstance(value, (int, float)) or value < 0 or value > 100 for value in threshold_order):
+            return False, "Score thresholds must be numeric values between 0 and 100"
+        if threshold_order != sorted(threshold_order):
+            return False, "Score thresholds must be in ascending severity order"
 
     # Validate baseline min_records
     if "baseline" in settings:

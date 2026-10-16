@@ -113,6 +113,17 @@ export const api = {
   getIncidentEvidence: (incidentId) =>
     request(`/api/incidents/${encodeURIComponent(incidentId)}/evidence`),
 
+  getIncidentGraph: (incidentId) =>
+    request(`/api/incidents/${encodeURIComponent(incidentId)}/graph`),
+
+  getQualcommIncidentAnalysis: (incidentId) =>
+    request(`/api/incidents/${encodeURIComponent(incidentId)}/qualcomm-analysis`),
+
+  runQualcommIncidentAnalysis: (incidentId) =>
+    request(`/api/incidents/${encodeURIComponent(incidentId)}/qualcomm-analysis`, {
+      method: 'POST',
+    }),
+
   getFindings: (host = '') => {
     const query = host ? `?host=${encodeURIComponent(host)}` : '';
     return request(`/api/findings${query}`);

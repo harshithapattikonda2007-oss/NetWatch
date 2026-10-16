@@ -66,6 +66,20 @@ export default function SettingsPage() {
     }));
   };
 
+  const handleRuleWeightChange = (ruleId, val) => {
+    const num = parseFloat(val);
+    setConfig((prev) => ({
+      ...prev,
+      scoring: {
+        ...prev.scoring,
+        rule_weights: {
+          ...prev.scoring.rule_weights,
+          [ruleId]: num,
+        },
+      },
+    }));
+  };
+
   const handleSave = async () => {
     try {
       setSaving(true);
@@ -472,6 +486,53 @@ export default function SettingsPage() {
               onChange={(e) => handleWeightChange('category_diversity', e.target.value)}
             />
           </div>
+          <div>
+            <label className="form-label" style={{ fontSize: 12 }}>Rule Priority Weight</label>
+            <input
+              type="number"
+              min="0"
+              max="1"
+              step="0.05"
+              className="form-control"
+              value={config.scoring?.weights?.rule_priority ?? 0.10}
+              onChange={(e) => handleWeightChange('rule_priority', e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="form-label" style={{ fontSize: 12 }}>Correlation Weight</label>
+            <input
+              type="number"
+              min="0"
+              max="1"
+              step="0.05"
+              className="form-control"
+              value={config.scoring?.weights?.correlation ?? 0.10}
+              onChange={(e) => handleWeightChange('correlation', e.target.value)}
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: 24 }}>
+        <div className="card-title"><span>Detection Rule Priority Weights (0-100)</span></div>
+        <p style={{ color: '#94a3b8', fontSize: 13, marginBottom: 16 }}>
+          Rule priorities affect the rule-priority component of each incident score. Changes apply on the next analysis run.
+        </p>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 }}>
+          {Object.entries(config.scoring?.rule_weights || {}).map(([ruleId, weight]) => (
+            <div key={ruleId}>
+              <label className="form-label" style={{ fontSize: 12 }}>{ruleId.replace('RULE_', '').replaceAll('_', ' ')}</label>
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                className="form-control"
+                value={weight}
+                onChange={(e) => handleRuleWeightChange(ruleId, e.target.value)}
+              />
+            </div>
+          ))}
         </div>
       </div>
 

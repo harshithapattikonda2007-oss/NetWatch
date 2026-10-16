@@ -27,8 +27,9 @@ NetWatch is a local, full-stack cybersecurity web application designed to analyz
    - **Rule I (Blocked or Failed Connections)**: Abnormal surges in firewall denials or authentication failures.
 5. **Incident Grouping & Deterministic Priority Scoring (0–100)**:
    - Groups related findings by affected host, time window, and attack category.
-   - Calculates transparent investigation priority scores using configurable weights:
-     $$\text{Score} = w_{\text{sev}} S_{\text{sev}} + w_{\text{dev}} S_{\text{dev}} + w_{\text{pers}} S_{\text{pers}} + w_{\text{cat}} S_{\text{cat}}$$
+    - Calculates each incident's deterministic 0-100 risk score from configured severity, deviation, evidence persistence, rule diversity, rule priority, and incident-correlation factors, then applies the trusted-activity multiplier:
+       $$\text{Score} = \operatorname{clamp}_{0..100}\left(\left(\sum_i w_i S_i\right) \times M_{\text{trust}}\right)$$
+    - Shows component points, configured weights, per-rule priority contributions, finding counts, trust adjustment, and supporting flow evidence for each incident.
    - Provides plausible benign explanations and standardized SOC investigation checklists.
    - Keeps findings for audit, but excludes configured approved activities and scheduled maintenance from incident scoring; trusted-server suppression is limited to low-severity findings.
 6. **13 Complete Application Views**:
@@ -38,6 +39,9 @@ NetWatch is a local, full-stack cybersecurity web application designed to analyz
    - Standalone HTML forensic intelligence report with fully escaped untrusted text.
 8. **Optional Local Ollama Support**:
    - If a local Ollama instance is running, provides local AI triage assessment; otherwise falls back gracefully to deterministic cybersecurity synthesis.
+9. **Qualcomm AI Evidence Analysis**:
+   - Uses official local GenieX runtime with verified incident rules, risk calculation, and supporting traffic evidence; deterministic results remain available when GenieX is not configured.
+   - Model confidence is reported as unavailable because GenieX chat does not provide a calibrated confidence value.
 
 ---
 
@@ -187,6 +191,33 @@ Open `http://localhost:5173` in your browser.
 - Regression scenarios assert detection of a suspicious horizontal sweep and internal spread, while an authorized scanner retains an auditable finding but creates no scored incident. This is scenario-based validation, not a statistically representative production accuracy estimate.
 - Limitations: configured internal networks are prefix-based; maintenance schedules use local timestamps treated as UTC; approved source identities are IP-based and should be tightly controlled. Encrypted payloads and process-level attribution are outside flow-log visibility.
 
+### Mission 03 Notes
+- Host Analysis compares evaluation-period connection rate, bytes sent, average flow size, destination diversity, and failure rate against the host's learning baseline.
+- Traffic Analytics marks actionable findings by time bucket and shows the observed measurement, configured threshold, and rule explanation. Approved/scheduled activity remains visible but is visually distinguished.
+- Beacon findings include each supporting connection timestamp and measured inter-arrival gap, with mean interval, standard deviation, and coefficient of variation.
+- Incident timelines label likely behavioral stages; incident detail includes a communication graph built from that incident's supporting flow records and score/rule/evidence breakdowns.
+- Regression scenarios compare a suspicious regular beacon against a configured periodic log-aggregation service to validate false-positive handling.
+
+### Qualcomm GenieX Setup
+Qualcomm AI Hub lists [Qwen3-4B-Instruct-2507](https://aihub.qualcomm.com/models/qwen3_4b_instruct_2507) as an instruction-following model and documents its GenieX deployment path. GenieX provides a local OpenAI-compatible server; AI Hub Workbench is used for device compile/profile/inference jobs, not as a generic hosted chat endpoint. NetWatch only connects to loopback addresses.
+
+1. On a supported Qualcomm Windows ARM device, install the [GenieX CLI](https://geniex.aihub.qualcomm.com/en/run/cli/install/).
+2. Pull the model and start the local server:
+
+```powershell
+geniex pull ai-hub-models/Qwen3-4B-Instruct-2507
+geniex serve
+```
+
+3. In the backend's PowerShell session, configure the local endpoint and model before starting/restarting NetWatch:
+
+```powershell
+$env:QUALCOMM_GENIEX_BASE_URL = "http://127.0.0.1:18181/v1"
+$env:QUALCOMM_GENIEX_MODEL = "ai-hub-models/Qwen3-4B-Instruct-2507"
+```
+
+The local GenieX server does not require an API token. If a local authenticated proxy is used, set `QUALCOMM_GENIEX_API_KEY` in the backend environment; it is never returned to or used by the frontend. Without a running local GenieX server, NetWatch labels the integration pending/unavailable and continues to show only verified detector results. AI narrative is advisory and does not alter risk scores or claim model confidence.
+
 ### Backend Pytest Suite
 Run the backend test suite from the project root:
 
@@ -195,7 +226,7 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch
 .venv\Scripts\pytest backend\tests -v
 ```
 
-**Results (13/13 Passed)**:
+**Results (22/22 Passed)**:
 - `test_suggest_column_mapping` (Auto-aliasing of common flow headers)
 - `test_zeek_schema_maps_to_canonical_fields_and_matches_default` (Alternate field names normalize to the canonical flow schema)
 - `test_zeek_tsv_upload_auto_maps_columns` (Tab-delimited upload selects the configured schema profile)
@@ -207,6 +238,11 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch
 - `test_sweep_lateral_detection_and_legitimate_activity_suppression` (Suspicious sweep/spread detection and authorized scanner false-positive reduction)
 - `test_missing_dns_and_outcome_fields` (Graceful handling without data fabrication)
 - `test_incident_grouping_and_scoring` (Correlation and deterministic formula calculation)
+- `test_incident_score_uses_configured_rule_and_trusted_activity_weights` (Configured rule priority, correlation gain, and trusted multiplier)
+- `test_incident_severity_score_boundaries` (Low/Medium/High/Critical score-band boundaries)
+- `test_qualcomm_analysis_returns_verified_results_when_runtime_is_pending` (Evidence-grounded pending response with no fabricated AI result)
+- `test_qualcomm_rejects_remote_runtime_urls` (Local-only GenieX endpoint enforcement)
+- `test_analytics_include_destination_hosts_dns_flows_and_nonempty_buckets` (Analytics reflect both flow endpoints, DNS transport, nonempty time bins, and incident edges)
 - `test_configuration_validation` (Settings schema and weight sum validation)
 - `test_api_sample_load_and_workflow` (End-to-end integration test of all API routes and exports)
 
