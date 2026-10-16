@@ -140,6 +140,29 @@ Open `http://localhost:5173` in your browser.
 
 ---
 
+## Deploy on Render Free
+
+The repository includes a single-service Docker deployment. Render builds the Vite frontend, copies it into the FastAPI image, and serves the UI and `/api` from the same origin.
+
+1. Push this repository to GitHub.
+2. In Render, choose **New > Blueprint**, connect the GitHub repository, and deploy the root `render.yaml`.
+3. Wait for the first build, then open the `onrender.com` URL. Render checks `/api/health`.
+
+No production frontend API URL or secret is required. Optional Qualcomm GenieX stays pending on Render Free: it requires a local supported Qualcomm device and loopback server, which a generic Render container does not provide.
+
+**Render Free limitations:** the web service spins down after 15 minutes without inbound traffic and can take about a minute to wake. Its filesystem is ephemeral, and NetWatch currently keeps uploaded datasets, baselines, findings, and incidents in process memory. They are lost on restarts, deploys, or spin-down and aren't shared across instances. This setup is suitable for demos/testing, not durable multi-user production. Durable storage requires a backend persistence design; Render Free Postgres expires after 30 days and is not a permanent free production store.
+
+To smoke-test the production image locally:
+
+```powershell
+docker build -t netwatch .
+docker run --rm -p 10000:10000 netwatch
+```
+
+Then open `http://localhost:10000` and check `http://localhost:10000/api/health`.
+
+---
+
 ## Workflow Guide
 
 ### 1. Load Synthetic Demonstration Dataset

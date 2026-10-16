@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -1378,3 +1379,22 @@ def export_html_investigation_report():
         media_type="text/html",
         headers={"Content-Disposition": 'attachment; filename="netwatch_investigation_report.html"'}
     )
+
+
+FRONTEND_DIST_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist"
+)
+FRONTEND_INDEX = os.path.join(FRONTEND_DIST_DIR, "index.html")
+
+if os.path.isfile(FRONTEND_INDEX):
+    @app.get("/{frontend_path:path}", include_in_schema=False)
+    def serve_frontend(frontend_path: str):
+        if frontend_path == "api" or frontend_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+
+        requested_file = os.path.realpath(os.path.join(FRONTEND_DIST_DIR, frontend_path))
+        dist_root = os.path.realpath(FRONTEND_DIST_DIR)
+        if os.path.commonpath([dist_root, requested_file]) == dist_root and os.path.isfile(requested_file):
+            return FileResponse(requested_file)
+
+        return FileResponse(FRONTEND_INDEX, headers={"Cache-Control": "no-cache"})
