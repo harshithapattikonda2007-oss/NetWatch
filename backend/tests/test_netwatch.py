@@ -13,6 +13,7 @@ if "config" in sys.modules and not hasattr(sys.modules["config"], "load_settings
 
 from fastapi.testclient import TestClient
 try:
+    import backend.main as main_module
     from backend.config import load_settings, save_settings, validate_settings, DEFAULT_SETTINGS
     from backend.data_processor import (
         suggest_column_mapping,
@@ -39,6 +40,7 @@ try:
     from backend.auth import ADMIN_ROLE, ANALYST_ROLE, bootstrap_configured_accounts, create_account, configured_demo_accounts
     from backend.main import app, state
 except ImportError:
+    import main as main_module
     from config import load_settings, save_settings, validate_settings, DEFAULT_SETTINGS
     from data_processor import (
         suggest_column_mapping,
@@ -104,6 +106,24 @@ def test_authentication_signup_login_and_protected_api():
     assert anonymous_client.get("/api/dashboard").status_code == 200
     assert anonymous_client.post("/api/auth/logout").status_code == 200
     assert anonymous_client.get("/api/dashboard").status_code == 401
+
+
+def test_frontend_routes_serve_spa_and_built_assets(monkeypatch, tmp_path):
+    dist_dir = tmp_path / "dist"
+    assets_dir = dist_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    index_file = dist_dir / "index.html"
+    index_file.write_text('<div id="root">NetWatch</div>', encoding="utf-8")
+    asset_file = assets_dir / "app.js"
+    asset_file.write_text("console.log('NetWatch');", encoding="utf-8")
+    monkeypatch.setattr(main_module, "FRONTEND_DIST_DIR", str(dist_dir))
+    monkeypatch.setattr(main_module, "FRONTEND_INDEX", str(index_file))
+
+    test_client = TestClient(app)
+    assert test_client.get("/login").text == '<div id="root">NetWatch</div>'
+    assert test_client.get("/assets/app.js").text == "console.log('NetWatch');"
+    assert test_client.get("/assets/missing.js").status_code == 404
+    assert test_client.get("/api/health").status_code == 200
 
 
 def test_signup_rejects_weak_password():

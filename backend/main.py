@@ -1658,15 +1658,18 @@ FRONTEND_DIST_DIR = os.path.join(
 )
 FRONTEND_INDEX = os.path.join(FRONTEND_DIST_DIR, "index.html")
 
-if os.path.isfile(FRONTEND_INDEX):
-    @app.get("/{frontend_path:path}", include_in_schema=False)
-    def serve_frontend(frontend_path: str):
-        if frontend_path == "api" or frontend_path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="API endpoint not found")
+@app.get("/{frontend_path:path}", include_in_schema=False)
+def serve_frontend(frontend_path: str):
+    if frontend_path == "api" or frontend_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API endpoint not found")
+    if not os.path.isfile(FRONTEND_INDEX):
+        raise HTTPException(status_code=503, detail="Frontend application is not built")
 
-        requested_file = os.path.realpath(os.path.join(FRONTEND_DIST_DIR, frontend_path))
-        dist_root = os.path.realpath(FRONTEND_DIST_DIR)
-        if os.path.commonpath([dist_root, requested_file]) == dist_root and os.path.isfile(requested_file):
-            return FileResponse(requested_file)
+    requested_file = os.path.realpath(os.path.join(FRONTEND_DIST_DIR, frontend_path))
+    dist_root = os.path.realpath(FRONTEND_DIST_DIR)
+    if os.path.commonpath([dist_root, requested_file]) == dist_root and os.path.isfile(requested_file):
+        return FileResponse(requested_file)
+    if os.path.splitext(frontend_path)[1]:
+        raise HTTPException(status_code=404, detail="Frontend asset not found")
 
-        return FileResponse(FRONTEND_INDEX, headers={"Cache-Control": "no-cache"})
+    return FileResponse(FRONTEND_INDEX, headers={"Cache-Control": "no-cache"})

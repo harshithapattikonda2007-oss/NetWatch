@@ -159,7 +159,7 @@ The repository includes a single-service Docker deployment. Render builds the Vi
 
 1. Push this repository to GitHub.
 2. In Render, choose **New > Blueprint**, connect the GitHub repository, and deploy the root `render.yaml`.
-3. Wait for the first build, then open the `onrender.com` URL. Render checks `/api/health`.
+3. Wait for the first build, then open the `onrender.com` URL and the direct `/login` URL. Both should serve the React app; Render checks `/api/health`.
 
 Render generates `NETWATCH_SESSION_SECRET` through `render.yaml`; do not commit session secrets or passwords. Local development generates a process-local session secret unless `NETWATCH_SESSION_SECRET` is set.
 
