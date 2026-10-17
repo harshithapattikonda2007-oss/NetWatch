@@ -25,3 +25,6 @@ Thumbs.db
 
 # Uploads and temporary data
 backend/temp_uploads/
+data/netwatch_auth.sqlite3
+data/netwatch_auth.sqlite3-shm
+data/netwatch_auth.sqlite3-wal

@@ -11,3 +11,5 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: NETWATCH_SESSION_SECRET
+        generateValue: true

@@ -2,6 +2,16 @@
 
 NetWatch is a local, full-stack cybersecurity web application designed to analyze network-flow CSV datasets, detect unusual behavioral anomalies across individual hosts, correlate related findings into prioritized security incidents, and assist analysts with evidence-backed forensic investigation.
 
+NetWatch requires account sign-in. Passwords are stored as salted PBKDF2 hashes, and authenticated API access uses signed, HttpOnly session cookies. On Render Free, the SQLite account database is on ephemeral storage and can be lost when the service restarts or spins down; configure durable storage/database before relying on persistent accounts. Investigation datasets also remain in process memory and are not isolated per user.
+
+### Roles and demo access
+
+- **Admin** can access every application feature, manage accounts and role assignments, review the permission matrix and audit log, configure detection settings, and build baselines.
+- **Security Analyst** can upload and analyze traffic, view baseline and investigation data, manage incident status, and export reports. Analyst API requests cannot manage accounts, edit detection settings, or build baselines.
+- API authorization is enforced server-side for every protected route; unclassified API routes are denied. Frontend navigation and page controls reflect the same role capabilities.
+
+There are no built-in demo passwords. To provision an administrator on first startup, configure `NETWATCH_BOOTSTRAP_ADMIN_EMAIL` and `NETWATCH_BOOTSTRAP_ADMIN_PASSWORD` (minimum 12 characters). To show clickable login-page demo accounts, explicitly set `NETWATCH_ENABLE_DEMO_ACCOUNTS=true` and provide `NETWATCH_DEMO_ADMIN_EMAIL`, `NETWATCH_DEMO_ADMIN_PASSWORD`, `NETWATCH_DEMO_ANALYST_EMAIL`, and `NETWATCH_DEMO_ANALYST_PASSWORD`. Demo credentials are only returned by the public demo-account endpoint while this opt-in is enabled and the configured accounts authenticate with the expected roles. Keep demo accounts disabled outside an isolated demo environment.
+
 ---
 
 ## Key Features
@@ -32,8 +42,8 @@ NetWatch is a local, full-stack cybersecurity web application designed to analyz
     - Shows component points, configured weights, per-rule priority contributions, finding counts, trust adjustment, and supporting flow evidence for each incident.
    - Provides plausible benign explanations and standardized SOC investigation checklists.
    - Keeps findings for audit, but excludes configured approved activities and scheduled maintenance from incident scoring; trusted-server suppression is limited to low-severity findings.
-6. **13 Complete Application Views**:
-   - Dashboard, Upload & Mapping, Data Quality, Baseline & Learning, Traffic Analytics, Host Analysis, Port Heatmap Analysis, DNS Analysis, Cytoscape.js Network Graph, Incidents Queue, Incident Details & Evidence, Detection Settings, and Reports & Exports.
+6. **14 Complete Application Views**:
+   - Dashboard, Upload & Mapping, Data Quality, Baseline & Learning, Traffic Analytics, Host Analysis, Port Heatmap Analysis, DNS Analysis, Cytoscape.js Network Graph, Incidents Queue, Incident Details & Evidence, Detection Settings, Reports & Exports, and Admin & Access Control.
 7. **Forensic Exports**:
    - CSV exports protected against formula injection (`=`, `+`, `-`, `@` prepended with `'`).
    - Standalone HTML forensic intelligence report with fully escaped untrusted text.
@@ -51,6 +61,7 @@ NetWatch is a local, full-stack cybersecurity web application designed to analyz
 netwatch/
 ├── backend/
 │   ├── main.py                     # FastAPI REST API endpoints
+│   ├── auth.py                     # Password hashing, sessions, roles, and account storage
 │   ├── data_processor.py           # CSV parsing, mapping, validation & baseline computation
 │   ├── detection.py                # 7 rule anomaly engines, incident grouping & deterministic scoring
 │   ├── analytics.py                # Traffic series, port heatmap, host profiling & network graph
@@ -58,13 +69,15 @@ netwatch/
 │   ├── generate_sample.py          # Synthetic dataset generator
 │   ├── requirements.txt            # Python dependencies
 │   └── tests/
-│       └── test_netwatch.py        # Pytest test suite (10 comprehensive tests)
+│       └── test_netwatch.py        # API, role authorization, and analytics test suite
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── Sidebar.jsx         # Navigation sidebar with status indicators
 │   │   │   └── TopBar.jsx          # Header with dataset status & sample loading
 │   │   ├── pages/
+│   │   │   ├── AdminPage.jsx       # Account roles, permission matrix, and audit log
+│   │   │   ├── AuthPage.jsx        # Sign-in, signup, and opt-in demo account autofill
 │   │   │   ├── DashboardPage.jsx   # Metrics, charts, top talkers, incident queue
 │   │   │   ├── UploadPage.jsx      # CSV upload, preview & column mapping
 │   │   │   ├── DataQualityPage.jsx # Audit of valid, rejected & duplicate records
@@ -147,6 +160,10 @@ The repository includes a single-service Docker deployment. Render builds the Vi
 1. Push this repository to GitHub.
 2. In Render, choose **New > Blueprint**, connect the GitHub repository, and deploy the root `render.yaml`.
 3. Wait for the first build, then open the `onrender.com` URL. Render checks `/api/health`.
+
+Render generates `NETWATCH_SESSION_SECRET` through `render.yaml`; do not commit session secrets or passwords. Local development generates a process-local session secret unless `NETWATCH_SESSION_SECRET` is set.
+
+For local demo logins, set the demo-account environment variables above before starting the backend. The login screen fills the selected account credentials only; the user must still submit **Sign in**. Set `NETWATCH_CORS_ORIGINS` to a comma-separated list of trusted frontend origins when the frontend and API are served from different origins. Same-origin deployments need no extra CORS origins.
 
 No production frontend API URL or secret is required. Optional Qualcomm GenieX stays pending on Render Free: it requires a local supported Qualcomm device and loopback server, which a generic Render container does not provide.
 
@@ -249,7 +266,11 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch
 .venv\Scripts\pytest backend\tests -v
 ```
 
-**Results (22/22 Passed)**:
+**Results (26/26 Passed)**:
+- `test_authentication_signup_login_and_protected_api` (Signed session cookies, protected APIs, and logout)
+- `test_role_permissions_enforced_for_admin_and_analyst` (Admin/analyst access and live role changes)
+- `test_demo_accounts_are_opt_in_and_environment_configured` (Environment-configured demo accounts and opt-in exposure)
+- `test_signup_rejects_weak_password` (Minimum password length)
 - `test_suggest_column_mapping` (Auto-aliasing of common flow headers)
 - `test_zeek_schema_maps_to_canonical_fields_and_matches_default` (Alternate field names normalize to the canonical flow schema)
 - `test_zeek_tsv_upload_auto_maps_columns` (Tab-delimited upload selects the configured schema profile)

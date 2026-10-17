@@ -10,6 +10,7 @@ FROM python:3.12-slim-bookworm AS app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    NETWATCH_AUTH_DB=/app/data/netwatch_auth.sqlite3 \
     PORT=10000
 
 WORKDIR /app
@@ -21,6 +22,7 @@ COPY backend/ /app/backend/
 COPY config/ /app/config/
 COPY data/ /app/data/
 COPY --from=frontend-build /build/frontend/dist/ /app/frontend/dist/
+RUN chown -R netwatch:netwatch /app/data
 
 USER netwatch
 EXPOSE 10000

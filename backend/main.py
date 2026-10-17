@@ -5,11 +5,13 @@ import html
 import json
 import httpx
 import pandas as pd
+import secrets
 from urllib.parse import urlsplit
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -26,6 +28,22 @@ if "config" in sys.modules and not hasattr(sys.modules["config"], "load_settings
     del sys.modules["config"]
 
 try:
+    from .auth import (
+        SESSION_TTL_SECONDS,
+        ADMIN_ROLE,
+        ANALYST_ROLE,
+        authenticate_account,
+        bootstrap_configured_accounts,
+        change_account_role,
+        configured_demo_accounts,
+        create_account,
+        create_session_token,
+        get_session_user,
+        list_accounts,
+        list_audit_events,
+        permissions_for_role,
+        write_audit_event
+    )
     from .config import load_settings, save_settings, validate_settings
     from .data_processor import (
         suggest_column_mapping,
@@ -48,6 +66,22 @@ try:
     )
 except ImportError:
     try:
+        from backend.auth import (
+            SESSION_TTL_SECONDS,
+            ADMIN_ROLE,
+            ANALYST_ROLE,
+            authenticate_account,
+            bootstrap_configured_accounts,
+            change_account_role,
+            configured_demo_accounts,
+            create_account,
+            create_session_token,
+            get_session_user,
+            list_accounts,
+            list_audit_events,
+            permissions_for_role,
+            write_audit_event
+        )
         from backend.config import load_settings, save_settings, validate_settings
         from backend.data_processor import (
             suggest_column_mapping,
@@ -69,6 +103,22 @@ except ImportError:
             build_network_graph
         )
     except ImportError:
+        from auth import (
+            SESSION_TTL_SECONDS,
+            ADMIN_ROLE,
+            ANALYST_ROLE,
+            authenticate_account,
+            bootstrap_configured_accounts,
+            change_account_role,
+            configured_demo_accounts,
+            create_account,
+            create_session_token,
+            get_session_user,
+            list_accounts,
+            list_audit_events,
+            permissions_for_role,
+            write_audit_event
+        )
         from config import load_settings, save_settings, validate_settings
         from data_processor import (
             suggest_column_mapping,
@@ -96,14 +146,91 @@ app = FastAPI(
     version="1.0.0"
 )
 
+bootstrap_configured_accounts()
+
 # Enable CORS for local Vite dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "NETWATCH_CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173"
+        ).split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+AUTH_SESSION_SECRET = os.getenv("NETWATCH_SESSION_SECRET") or secrets.token_urlsafe(48)
+AUTH_COOKIE_NAME = "netwatch_session"
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/auth/signup",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/session",
+    "/api/auth/demo-accounts"
+}
+
+
+def permission_for_api(path: str, method: str) -> Optional[str]:
+    if path.startswith("/api/admin/"):
+        return "admin:manage"
+    if path == "/api/config":
+        return "admin:settings"
+    if method == "POST" and path in {"/api/upload", "/api/sample/load", "/api/dataset/map-and-validate"}:
+        return "dataset:upload"
+    if method == "POST" and path == "/api/baseline/build":
+        return "baseline:build"
+    if method == "GET" and path == "/api/baseline":
+        return "baseline:view"
+    if method == "POST" and path == "/api/analysis/run":
+        return "analysis:run"
+    if method == "PATCH" and path.startswith("/api/incidents/") and path.endswith("/status"):
+        return "incidents:manage"
+    if method == "GET" and path == "/api/findings":
+        return "findings:view"
+    if method == "GET" and (path == "/api/incidents" or path.startswith("/api/incidents/")):
+        return "incidents:view"
+    if method == "POST" and path.startswith("/api/incidents/") and path.endswith(("/qualcomm-analysis", "/ai-explain")):
+        return "incidents:view"
+    if method == "GET" and path.startswith("/api/export/"):
+        return "reports:export"
+    if method == "GET" and (
+        path in {
+            "/api/analytics/traffic",
+            "/api/analytics/hosts",
+            "/api/analytics/ports",
+            "/api/analytics/dns",
+            "/api/dataset/preview",
+            "/api/dataset/time-range",
+            "/api/data-quality",
+            "/api/dashboard",
+            "/api/graph"
+        }
+        or path.startswith("/api/analytics/host/")
+    ):
+        return "analytics:view"
+    return None
+
+
+@app.middleware("http")
+async def require_api_session(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in PUBLIC_API_PATHS and request.method != "OPTIONS":
+        user = get_session_user(request.cookies.get(AUTH_COOKIE_NAME), AUTH_SESSION_SECRET)
+        if user is None:
+            return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        permission = permission_for_api(path, request.method)
+        if permission is None or (
+            "*" not in user["permissions"] and permission not in user["permissions"]
+        ):
+            return JSONResponse({"detail": "This role is not permitted to perform this action"}, status_code=403)
+        request.state.user = user
+    return await call_next(request)
 
 
 # In-Memory State for Active Investigation Session
@@ -117,6 +244,7 @@ class ApplicationState:
         self.baseline: Optional[Dict[str, Any]] = None
         self.findings: List[Dict[str, Any]] = []
         self.incidents: List[Dict[str, Any]] = []
+        self.incident_status: Dict[str, str] = {}
         self.analysis_complete: bool = False
         self.analysis_message: Optional[str] = None
         self.evaluation_records: int = 0
@@ -223,6 +351,23 @@ class AnalysisRequest(BaseModel):
     eval_end: str
 
 
+class AuthCredentials(BaseModel):
+    email: str
+    password: str
+
+
+class RoleUpdateRequest(BaseModel):
+    role: str
+
+
+class AdminAccountCreateRequest(AuthCredentials):
+    role: str = ANALYST_ROLE
+
+
+class IncidentStatusRequest(BaseModel):
+    status: str
+
+
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
@@ -239,6 +384,99 @@ def health_check():
         "baseline_ready": state.baseline is not None,
         "analysis_ready": state.analysis_complete
     }
+
+
+@app.post("/api/auth/signup", status_code=201)
+def signup(req: AuthCredentials):
+    try:
+        user = create_account(req.email, req.password)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    write_audit_event("account_created", user, user["email"], {"role": user["role"]})
+    return {"success": True, "user": user, "message": "Account created. Sign in to continue."}
+
+
+@app.post("/api/auth/login")
+def login(req: AuthCredentials, request: Request):
+    user = authenticate_account(req.email, req.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Email or password is incorrect")
+
+    token = create_session_token(user, AUTH_SESSION_SECRET)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    secure_cookie = request.url.scheme == "https" or forwarded_proto == "https"
+    response = JSONResponse({"success": True, "user": user})
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="strict",
+        path="/"
+    )
+    write_audit_event("login", user, user["email"])
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request):
+    user = get_session_user(request.cookies.get(AUTH_COOKIE_NAME), AUTH_SESSION_SECRET)
+    if user:
+        write_audit_event("logout", user, user["email"])
+    response = JSONResponse({"success": True})
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/", httponly=True, samesite="strict")
+    return response
+
+
+@app.get("/api/auth/session")
+def auth_session(request: Request):
+    user = get_session_user(request.cookies.get(AUTH_COOKIE_NAME), AUTH_SESSION_SECRET)
+    return {"authenticated": user is not None, "user": user}
+
+
+@app.get("/api/auth/demo-accounts")
+def get_demo_accounts(response: Response):
+    accounts = configured_demo_accounts()
+    response.headers["Cache-Control"] = "no-store"
+    return {"enabled": bool(accounts), "accounts": accounts}
+
+
+@app.get("/api/admin/permissions")
+def get_role_permissions():
+    return {"roles": {ADMIN_ROLE: permissions_for_role(ADMIN_ROLE), ANALYST_ROLE: permissions_for_role(ANALYST_ROLE)}}
+
+
+@app.get("/api/admin/users")
+def get_admin_users():
+    return {"users": list_accounts()}
+
+
+@app.post("/api/admin/users", status_code=201)
+def create_admin_user(req: AdminAccountCreateRequest, request: Request):
+    try:
+        user = create_account(req.email, req.password, req.role)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    write_audit_event("account_created_by_admin", request.state.user, user["email"], {"role": user["role"]})
+    return {"user": user}
+
+
+@app.patch("/api/admin/users/{user_id}/role")
+def update_user_role(user_id: str, req: RoleUpdateRequest, request: Request):
+    try:
+        user = change_account_role(user_id, req.role)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    write_audit_event("role_changed", request.state.user, user["email"], {"new_role": user["role"]})
+    return {"user": user}
+
+
+@app.get("/api/admin/audit")
+def get_admin_audit(limit: int = Query(200, ge=1, le=500)):
+    return {"events": list_audit_events(limit)}
 
 
 @app.post("/api/upload")
@@ -417,6 +655,22 @@ def get_time_range():
         "split_available": split_available,
         "suggested_learning_end": learning_end,
         "suggested_evaluation_start": evaluation_start
+    }
+
+
+@app.get("/api/baseline")
+def get_baseline():
+    if state.baseline is None:
+        return {"available": False, "baseline_summary": None}
+    return {
+        "available": True,
+        "baseline_summary": {
+            "learning_start": state.baseline["learning_start"],
+            "learning_end": state.baseline["learning_end"],
+            "learning_records_count": state.baseline["learning_records_count"],
+            "hosts_profiled_count": state.baseline["hosts_profiled_count"],
+            "created_at": state.baseline["created_at"]
+        }
     }
 
 
@@ -666,22 +920,39 @@ def get_network_graph():
 
 @app.get("/api/incidents")
 def get_incidents_list(severity: Optional[str] = Query(None)):
-    if not state.incidents:
-        return {"incidents": []}
-
+    incidents = state.incidents
     if severity:
-        filtered = [inc for inc in state.incidents if inc.get("severity") == severity]
-        return {"incidents": filtered}
-
-    return {"incidents": state.incidents}
+        incidents = [inc for inc in incidents if inc.get("severity") == severity]
+    return {
+        "incidents": [
+            {**incident, "status": state.incident_status.get(incident["incident_id"], "open")}
+            for incident in incidents
+        ]
+    }
 
 
 @app.get("/api/incidents/{incident_id}")
 def get_incident_detail(incident_id: str):
     for inc in state.incidents:
         if inc["incident_id"] == incident_id:
-            return inc
+            return {**inc, "status": state.incident_status.get(incident_id, "open")}
     raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+
+
+@app.patch("/api/incidents/{incident_id}/status")
+def update_incident_status(incident_id: str, req: IncidentStatusRequest, request: Request):
+    if req.status not in {"open", "acknowledged", "resolved"}:
+        raise HTTPException(status_code=400, detail="Status must be open, acknowledged, or resolved")
+    if not any(incident["incident_id"] == incident_id for incident in state.incidents):
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    state.incident_status[incident_id] = req.status
+    write_audit_event(
+        "incident_status_changed",
+        request.state.user,
+        incident_id,
+        {"status": req.status}
+    )
+    return {"incident_id": incident_id, "status": req.status}
 
 
 @app.get("/api/incidents/{incident_id}/evidence")
@@ -1062,7 +1333,7 @@ def export_incidents_csv():
     writer = csv.writer(output)
     writer.writerow([
         "Incident ID", "Title", "Affected Hosts", "Destinations",
-        "Severity", "Score", "First Seen", "Last Seen",
+        "Severity", "Status", "Score", "First Seen", "Last Seen",
         "Related Rules", "Findings Count", "Is Approved"
     ])
 
@@ -1073,6 +1344,7 @@ def export_incidents_csv():
             sanitize_csv_cell(", ".join(inc.get("affected_hosts", []))),
             sanitize_csv_cell(", ".join(inc.get("destinations", []))),
             sanitize_csv_cell(inc.get("severity")),
+            state.incident_status.get(inc["incident_id"], "open"),
             inc.get("score"),
             sanitize_csv_cell(inc.get("first_seen")),
             sanitize_csv_cell(inc.get("last_seen")),

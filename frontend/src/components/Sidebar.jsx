@@ -13,10 +13,12 @@ import {
   AlertTriangle,
   Sliders,
   FileText,
-  ShieldAlert
+  ShieldAlert,
+  UsersRound
 } from 'lucide-react';
 
-export default function Sidebar({ healthData }) {
+export default function Sidebar({ healthData, user }) {
+  const isAdmin = user?.role === 'admin';
   const navSections = [
     {
       title: 'Operations',
@@ -41,7 +43,10 @@ export default function Sidebar({ healthData }) {
       title: 'Investigation',
       items: [
         { path: '/incidents', label: 'Incidents', icon: AlertTriangle },
-        { path: '/settings', label: 'Detection Settings', icon: Sliders },
+        ...(isAdmin ? [
+          { path: '/settings', label: 'Detection Settings', icon: Sliders },
+          { path: '/admin', label: 'Admin & Access', icon: UsersRound },
+        ] : []),
         { path: '/reports', label: 'Reports & Exports', icon: FileText },
       ],
     },

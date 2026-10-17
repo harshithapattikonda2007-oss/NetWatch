@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { api } from '../services/api';
 
-export default function BaselinePage({ onBaselineOrAnalysisChanged }) {
+export default function BaselinePage({ canManageBaseline = false, onBaselineOrAnalysisChanged }) {
   const navigate = useNavigate();
   const [timeRange, setTimeRange] = useState(null);
   const [learningStart, setLearningStart] = useState('');
@@ -31,6 +31,9 @@ export default function BaselinePage({ onBaselineOrAnalysisChanged }) {
 
   useEffect(() => {
     setTimeRange(null);
+    api.getBaseline()
+      .then((data) => setBaselineSummary(data.baseline_summary || null))
+      .catch((err) => setError(`Failed to load baseline: ${err.message}`));
     api.getTimeRange()
       .then((data) => {
         if (data.available) {
@@ -56,7 +59,7 @@ export default function BaselinePage({ onBaselineOrAnalysisChanged }) {
           }
         }
       })
-      .catch((err) => console.error(err));
+      .catch((err) => setError(`Failed to load dataset time range: ${err.message}`));
   }, []);
 
   const handleBuildBaseline = async () => {
@@ -127,8 +130,7 @@ export default function BaselinePage({ onBaselineOrAnalysisChanged }) {
 
       {/* Period Selection Grid */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 20, marginBottom: 24 }}>
-        {/* Phase 1: Historical Learning Period */}
-        <div className="card" style={{ borderTop: '3px solid #38bdf8' }}>
+        {canManageBaseline && <div className="card" style={{ borderTop: '3px solid #38bdf8' }}>
           <div className="card-title">
             <span>1. Historical Learning Period</span>
             <span className="badge badge-low">Baseline Training</span>
@@ -183,7 +185,7 @@ export default function BaselinePage({ onBaselineOrAnalysisChanged }) {
             )}
             <span>{buildingBaseline ? 'Training Baseline Model...' : 'Build Historical Baseline'}</span>
           </button>
-        </div>
+        </div>}
 
         {/* Phase 2: Evaluation Period */}
         <div className="card" style={{ borderTop: '3px solid #6366f1' }}>
@@ -235,12 +237,11 @@ export default function BaselinePage({ onBaselineOrAnalysisChanged }) {
         </div>
       </div>
 
-      {/* Baseline Result Summary */}
-      {baselineSummary && (
+      {baselineSummary ? (
         <div className="card" style={{ marginBottom: 24 }}>
           <div className="card-title" style={{ color: '#10b981' }}>
             <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <CheckCircle size={18} /> Baseline Successfully Established
+              <CheckCircle size={18} /> Active Behavioral Baseline
             </span>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 14 }}>
@@ -263,6 +264,11 @@ export default function BaselinePage({ onBaselineOrAnalysisChanged }) {
               </div>
             </div>
           </div>
+        </div>
+      ) : (
+        <div className="alert alert-info">
+          <ShieldCheck size={18} />
+          <div>No baseline has been established for the active dataset yet.</div>
         </div>
       )}
 

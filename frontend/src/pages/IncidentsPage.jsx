@@ -1,38 +1,51 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
   ShieldAlert,
   ArrowRight,
-  Filter,
-  CheckCircle,
-  Clock,
-  Layers,
   Download
 } from 'lucide-react';
 import { api } from '../services/api';
 
-export default function IncidentsPage({ dataRevision }) {
+export default function IncidentsPage({ canManageIncidents = false, dataRevision }) {
   const navigate = useNavigate();
   const [incidents, setIncidents] = useState([]);
   const [severityFilter, setSeverityFilter] = useState('');
   const [loading, setLoading] = useState(true);
+  const [updatingIncident, setUpdatingIncident] = useState('');
+  const [error, setError] = useState('');
 
-  const fetchIncidents = async () => {
+  const fetchIncidents = useCallback(async () => {
     try {
-      setLoading(true);
       const res = await api.getIncidents(severityFilter);
       setIncidents(res.incidents || []);
+      setError('');
     } catch (err) {
-      console.error(err);
+      setError(err.message);
     } finally {
       setLoading(false);
+    }
+  }, [severityFilter]);
+
+  const handleStatusChange = async (incidentId, status) => {
+    setError('');
+    try {
+      setUpdatingIncident(incidentId);
+      await api.updateIncidentStatus(incidentId, status);
+      setIncidents((currentIncidents) => currentIncidents.map((incident) => (
+        incident.incident_id === incidentId ? { ...incident, status } : incident
+      )));
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setUpdatingIncident('');
     }
   };
 
   useEffect(() => {
     fetchIncidents();
-  }, [severityFilter, dataRevision]);
+  }, [fetchIncidents, dataRevision]);
 
   return (
     <div>
@@ -70,6 +83,8 @@ export default function IncidentsPage({ dataRevision }) {
         </div>
       </div>
 
+      {error && <div className="alert alert-danger"><AlertTriangle size={18} /><div>{error}</div></div>}
+
       {loading ? (
         <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '50vh' }}>
           <div className="spinner" style={{ width: 36, height: 36 }} />
@@ -97,6 +112,7 @@ export default function IncidentsPage({ dataRevision }) {
                 <th>Correlated Rules</th>
                 <th>Findings</th>
                 <th>Active Window</th>
+                {canManageIncidents && <th>Status</th>}
                 <th>Action</th>
               </tr>
             </thead>
@@ -170,6 +186,23 @@ export default function IncidentsPage({ dataRevision }) {
                       {inc.first_seen?.split(' ')[1] || inc.first_seen} &rarr;{' '}
                       {inc.last_seen?.split(' ')[1] || inc.last_seen}
                     </td>
+
+                    {canManageIncidents && (
+                      <td>
+                        <select
+                          className="form-control"
+                          aria-label={`Status for ${inc.incident_id}`}
+                          value={inc.status || 'open'}
+                          disabled={updatingIncident === inc.incident_id}
+                          onClick={(event) => event.stopPropagation()}
+                          onChange={(event) => handleStatusChange(inc.incident_id, event.target.value)}
+                        >
+                          <option value="open">Open</option>
+                          <option value="acknowledged">Acknowledged</option>
+                          <option value="resolved">Resolved</option>
+                        </select>
+                      </td>
+                    )}
 
                     <td>
                       <button

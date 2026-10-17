@@ -1,6 +1,7 @@
 import os
 import io
 import sys
+import uuid
 import pytest
 import pandas as pd
 from datetime import datetime, timedelta
@@ -35,6 +36,7 @@ try:
         get_dns_analysis,
         build_network_graph
     )
+    from backend.auth import ADMIN_ROLE, ANALYST_ROLE, bootstrap_configured_accounts, create_account, configured_demo_accounts
     from backend.main import app, state
 except ImportError:
     from config import load_settings, save_settings, validate_settings, DEFAULT_SETTINGS
@@ -60,13 +62,152 @@ except ImportError:
         get_dns_analysis,
         build_network_graph
     )
+    from auth import ADMIN_ROLE, ANALYST_ROLE, bootstrap_configured_accounts, create_account, configured_demo_accounts
     from main import app, state
 
 
 @pytest.fixture
 def client():
     state.reset()
-    return TestClient(app)
+    test_client = TestClient(app)
+    email = f"netwatch-test-{uuid.uuid4().hex}@example.test"
+    password = "Test-Suite-Password-2026!"
+    create_account(email, password, ADMIN_ROLE)
+    login_response = test_client.post("/api/auth/login", json={
+        "email": email,
+        "password": password
+    })
+    assert login_response.status_code == 200
+    return test_client
+
+
+def test_authentication_signup_login_and_protected_api():
+    anonymous_client = TestClient(app)
+    assert anonymous_client.get("/api/dashboard").status_code == 401
+    email = f"auth-{uuid.uuid4().hex}@example.test"
+    password = "Long-Enough-Test-Password-2035!"
+
+    signup = anonymous_client.post("/api/auth/signup", json={"email": email, "password": password})
+    assert signup.status_code == 201
+    assert signup.json()["user"]["email"] == email
+    assert "password" not in signup.json()["user"]
+    assert anonymous_client.get("/api/dashboard").status_code == 401
+
+    assert anonymous_client.post("/api/auth/login", json={
+        "email": email,
+        "password": "incorrect-password"
+    }).status_code == 401
+    login = anonymous_client.post("/api/auth/login", json={"email": email, "password": password})
+    assert login.status_code == 200
+    assert "httponly" in login.headers["set-cookie"].lower()
+    assert anonymous_client.get("/api/auth/session").json()["authenticated"] is True
+    assert anonymous_client.get("/api/dashboard").status_code == 200
+    assert anonymous_client.post("/api/auth/logout").status_code == 200
+    assert anonymous_client.get("/api/dashboard").status_code == 401
+
+
+def test_signup_rejects_weak_password():
+    response = TestClient(app).post("/api/auth/signup", json={
+        "email": f"weak-{uuid.uuid4().hex}@example.test",
+        "password": "short"
+    })
+    assert response.status_code == 400
+    assert "12 characters" in response.json()["detail"]
+
+
+def test_role_permissions_enforced_for_admin_and_analyst():
+    state.reset()
+    admin_email = f"admin-{uuid.uuid4().hex}@example.test"
+    admin_password = "Long-Enough-Admin-Password-2035!"
+    analyst_email = f"analyst-{uuid.uuid4().hex}@example.test"
+    analyst_password = "Long-Enough-Analyst-Password-2035!"
+    create_account(admin_email, admin_password, ADMIN_ROLE)
+
+    admin_client = TestClient(app)
+    admin_login = admin_client.post("/api/auth/login", json={
+        "email": admin_email,
+        "password": admin_password
+    })
+    assert admin_login.status_code == 200
+    assert "*" in admin_login.json()["user"]["permissions"]
+    assert admin_client.get("/api/admin/users").status_code == 200
+    assert admin_client.get("/api/admin/permissions").status_code == 200
+    assert admin_client.get("/api/admin/audit").status_code == 200
+    assert admin_client.get("/api/config").status_code == 200
+    assert admin_client.get("/api/baseline").status_code == 200
+    assert admin_client.post("/api/baseline/build", json={
+        "learning_start": "2026-01-01",
+        "learning_end": "2026-01-02"
+    }).status_code == 400
+
+    created = admin_client.post("/api/admin/users", json={
+        "email": analyst_email,
+        "password": analyst_password,
+        "role": ANALYST_ROLE
+    })
+    assert created.status_code == 201
+    analyst = created.json()["user"]
+    assert analyst["role"] == ANALYST_ROLE
+    assert "password" not in analyst
+
+    analyst_client = TestClient(app)
+    analyst_login = analyst_client.post("/api/auth/login", json={
+        "email": analyst_email,
+        "password": analyst_password
+    })
+    assert analyst_login.status_code == 200
+    analyst_permissions = analyst_login.json()["user"]["permissions"]
+    assert "incidents:manage" in analyst_permissions
+    assert "baseline:view" in analyst_permissions
+    assert "baseline:build" not in analyst_permissions
+    assert analyst_client.get("/api/admin/users").status_code == 403
+    assert analyst_client.get("/api/config").status_code == 403
+
+    assert admin_client.patch(f"/api/admin/users/{analyst['id']}/role", json={
+        "role": ADMIN_ROLE
+    }).status_code == 200
+    assert analyst_client.get("/api/admin/users").status_code == 200
+    assert admin_client.patch(f"/api/admin/users/{analyst['id']}/role", json={
+        "role": ANALYST_ROLE
+    }).status_code == 200
+    assert analyst_client.get("/api/admin/users").status_code == 403
+    assert admin_client.patch(f"/api/admin/users/{analyst['id']}/role", json={
+        "role": "unknown"
+    }).status_code == 400
+    assert admin_client.get("/api/admin/audit").json()["events"]
+
+    assert analyst_client.get("/api/baseline").json()["available"] is False
+    assert analyst_client.post("/api/baseline/build", json={
+        "learning_start": "2026-01-01",
+        "learning_end": "2026-01-02"
+    }).status_code == 403
+    assert analyst_client.patch("/api/incidents/unknown/status", json={
+        "status": "resolved"
+    }).status_code == 404
+    assert admin_client.get("/api/not-a-real-endpoint").status_code == 403
+    assert admin_client.get("/api/admin/users").json()["users"]
+
+
+def test_demo_accounts_are_opt_in_and_environment_configured(monkeypatch, tmp_path):
+    demo_admin_email = f"demo-admin-{uuid.uuid4().hex}@example.test"
+    demo_analyst_email = f"demo-analyst-{uuid.uuid4().hex}@example.test"
+    monkeypatch.setenv("NETWATCH_AUTH_DB", str(tmp_path / "demo-auth.sqlite3"))
+    monkeypatch.setenv("NETWATCH_ENABLE_DEMO_ACCOUNTS", "true")
+    monkeypatch.setenv("NETWATCH_DEMO_ADMIN_EMAIL", demo_admin_email)
+    monkeypatch.setenv("NETWATCH_DEMO_ADMIN_PASSWORD", "Long-Enough-Demo-Admin-2035!")
+    monkeypatch.setenv("NETWATCH_DEMO_ANALYST_EMAIL", demo_analyst_email)
+    monkeypatch.setenv("NETWATCH_DEMO_ANALYST_PASSWORD", "Long-Enough-Demo-Analyst-2035!")
+
+    bootstrap_configured_accounts()
+    accounts = configured_demo_accounts()
+    assert {account["role"] for account in accounts} == {ADMIN_ROLE, ANALYST_ROLE}
+    assert {account["email"] for account in accounts} == {demo_admin_email, demo_analyst_email}
+    response_accounts = TestClient(app).get("/api/auth/demo-accounts")
+    assert response_accounts.status_code == 200
+    assert {account["role"] for account in response_accounts.json()["accounts"]} == {ADMIN_ROLE, ANALYST_ROLE}
+
+    monkeypatch.setenv("NETWATCH_ENABLE_DEMO_ACCOUNTS", "false")
+    assert configured_demo_accounts() == []
 
 
 # -----------------------------------------------------------------------------
@@ -813,6 +954,14 @@ def test_api_sample_load_and_workflow(client):
     incs = res.json()["incidents"]
     assert len(incs) > 0
     first_inc_id = incs[0]["incident_id"]
+    assert incs[0]["status"] == "open"
+    status_update = client.patch(f"/api/incidents/{first_inc_id}/status", json={"status": "acknowledged"})
+    assert status_update.status_code == 200
+    assert client.get(f"/api/incidents/{first_inc_id}").json()["status"] == "acknowledged"
+    assert client.patch(f"/api/incidents/{first_inc_id}/status", json={"status": "invalid"}).status_code == 400
+    incident_export = client.get("/api/export/incidents")
+    assert "Status" in incident_export.text
+    assert "acknowledged" in incident_export.text
 
     res = client.get(f"/api/incidents/{first_inc_id}")
     assert res.status_code == 200

@@ -4,13 +4,16 @@
  */
 
 const BASE_URL = import.meta.env.VITE_API_URL || '';
+const SERVICE_UNAVAILABLE_MESSAGE = 'NetWatch service is temporarily unavailable. Please try again shortly.';
 
 async function request(endpoint, options = {}) {
   const url = `${BASE_URL}${endpoint}`;
   try {
-    const response = await fetch(url, options);
+    const response = await fetch(url, { credentials: 'same-origin', ...options });
     if (!response.ok) {
-      let errMsg = `Request failed with status ${response.status}`;
+      let errMsg = [502, 503, 504].includes(response.status)
+        ? SERVICE_UNAVAILABLE_MESSAGE
+        : `Request failed with status ${response.status}`;
       try {
         const errJson = await response.json();
         if (errJson && errJson.detail) {
@@ -23,12 +26,58 @@ async function request(endpoint, options = {}) {
     }
     return await response.json();
   } catch (error) {
+    if (error instanceof TypeError) {
+      error = new Error(SERVICE_UNAVAILABLE_MESSAGE);
+    }
     console.error(`API Error on ${endpoint}:`, error);
     throw error;
   }
 }
 
 export const api = {
+  // Authentication
+  getAuthSession: () => request('/api/auth/session'),
+  getDemoAccounts: () => request('/api/auth/demo-accounts'),
+
+  signUp: (email, password) => request('/api/auth/signup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  }),
+
+  login: (email, password) => request('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  }),
+
+  logout: () => request('/api/auth/logout', { method: 'POST' }),
+
+  // Admin
+  getAdminUsers: () => request('/api/admin/users'),
+
+  createAdminUser: (email, password, role) => request('/api/admin/users', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password, role }),
+  }),
+
+  updateUserRole: (userId, role) => request(`/api/admin/users/${encodeURIComponent(userId)}/role`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role }),
+  }),
+
+  getRolePermissions: () => request('/api/admin/permissions'),
+  getAuditEvents: (limit = 200) => request(`/api/admin/audit?limit=${limit}`),
+
+  updateIncidentStatus: (incidentId, status) =>
+    request(`/api/incidents/${encodeURIComponent(incidentId)}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    }),
+
   // System Health
   getHealth: () => request('/api/health'),
 
@@ -68,6 +117,8 @@ export const api = {
         min_records: minRecords,
       }),
     }),
+
+  getBaseline: () => request('/api/baseline'),
 
   runAnalysis: (evalStart, evalEnd) =>
     request('/api/analysis/run', {
