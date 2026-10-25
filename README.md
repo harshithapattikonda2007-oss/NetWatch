@@ -326,6 +326,21 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch
 - `test_configuration_validation` (Settings schema and weight sum validation)
 - `test_api_sample_load_and_workflow` (End-to-end integration test of all API routes and exports)
 
+## 🔄 System Workflow
+1. **Data Ingestion** – Upload network-flow CSV files through the dashboard.
+2. **Data Processing** – Validate and process the uploaded records using Python.
+3.  **Behavioral Analysis** – Establish or use historical traffic baselines to understand normal activity.
+4. **Anomaly Detection** – Apply configurable rules to identify suspicious traffic patterns.
+5. **Incident Assessment** – Correlate findings and prioritize suspicious activities for investigation.
+6. **Visualization** – Display traffic analytics, anomalies, and network relationships.
+7. **Report Generation** – Export investigation results in CSV or HTML format.
+
+**Results (26/26 Passed)**:
+- `test_authentication_signup_login_and_protected_api` (Signed session cookies, protected APIs, and logout)
+- `test_role_permissions_enforced_for_admin_and_analyst` (Admin/analyst access and live role changes)
+- `test_demo_accounts_are_opt_in_and_environment_configured` (Environment-configured demo accounts and opt-in exposure)
+- `test_signup_rejects_weak_password` (Minimum password length)
+
 ### Frontend Production Build
 Validate the React frontend build:
 
