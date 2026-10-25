@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+.pytest_cache
+node_modules
+frontend/node_modules
+frontend/dist
+frontend/.vite
+.env
+.env.*
+!.env.example
+*.log

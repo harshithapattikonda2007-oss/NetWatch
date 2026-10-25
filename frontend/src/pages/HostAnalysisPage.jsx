@@ -196,6 +196,52 @@ export default function HostAnalysisPage({ dataRevision }) {
             )}
           </div>
 
+          {hostDetails.behavior_comparison && (
+            <div className="card" style={{ marginBottom: 24 }}>
+              <div className="card-title">Normal vs Observed Network Behavior</div>
+              <p style={{ color: '#94a3b8', fontSize: 12, marginBottom: 14 }}>
+                Baseline: {hostDetails.behavior_comparison.learning_window} | Evaluation: {hostDetails.behavior_comparison.evaluation_window}
+              </p>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12 }}>
+                {hostDetails.behavior_comparison.metrics.map((metric) => {
+                  const maximum = Math.max(metric.normal, metric.observed, 1);
+                  const observedColor = metric.change_percent >= 50 || (metric.normal === 0 && metric.observed > 0)
+                    ? '#ef4444'
+                    : '#38bdf8';
+                  const formatValue = (value) => {
+                    if (metric.unit === 'B/hour' || metric.unit === 'B/flow') return `${(value / 1024).toFixed(1)} KB${metric.unit === 'B/hour' ? '/hour' : '/flow'}`;
+                    return `${value.toLocaleString()} ${metric.unit}`;
+                  };
+
+                  return (
+                    <div key={metric.key} style={{ padding: 12, background: 'rgba(30, 41, 59, 0.4)', borderRadius: 8 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>{metric.label}</div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '76px 1fr auto', gap: 8, alignItems: 'center', fontSize: 12, marginBottom: 6 }}>
+                        <span style={{ color: '#94a3b8' }}>Normal</span>
+                        <div style={{ height: 7, background: '#0f172a', borderRadius: 4 }}>
+                          <div style={{ width: `${metric.normal / maximum * 100}%`, height: '100%', background: '#64748b', borderRadius: 4 }} />
+                        </div>
+                        <span className="mono">{formatValue(metric.normal)}</span>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '76px 1fr auto', gap: 8, alignItems: 'center', fontSize: 12 }}>
+                        <span style={{ color: '#94a3b8' }}>Observed</span>
+                        <div style={{ height: 7, background: '#0f172a', borderRadius: 4 }}>
+                          <div style={{ width: `${metric.observed / maximum * 100}%`, height: '100%', background: observedColor, borderRadius: 4 }} />
+                        </div>
+                        <span className="mono">{formatValue(metric.observed)}</span>
+                      </div>
+                      <div style={{ color: observedColor, fontSize: 11, marginTop: 8 }}>
+                        {metric.change_percent === null
+                          ? 'No baseline activity for comparison'
+                          : `${metric.change_percent >= 0 ? '+' : ''}${metric.change_percent}% vs baseline`}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Grid: Destinations & Ports */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 20, marginBottom: 24 }}>
             {/* Top Destinations */}

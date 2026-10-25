@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Database, Play, Sparkles, RefreshCw } from 'lucide-react';
+import { Database, Play, Sparkles, RefreshCw, LogOut } from 'lucide-react';
 import { api } from '../services/api';
 
-export default function TopBar({ healthData, onRefresh }) {
+export default function TopBar({ healthData, onRefresh, onLogout, user }) {
   const navigate = useNavigate();
   const [loadingSample, setLoadingSample] = useState(false);
 
@@ -32,6 +32,9 @@ export default function TopBar({ healthData, onRefresh }) {
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <span style={{ color: '#94a3b8', fontSize: 12 }}>
+          {user?.email} · {user?.role === 'admin' ? 'Admin' : 'Security Analyst'}
+        </span>
         <button
           className="btn btn-secondary btn-sm"
           onClick={handleLoadSample}
@@ -61,6 +64,15 @@ export default function TopBar({ healthData, onRefresh }) {
           style={{ padding: '6px 8px' }}
         >
           <RefreshCw size={14} />
+        </button>
+        <button
+          className="btn btn-secondary btn-sm"
+          onClick={onLogout}
+          title="Sign out"
+          aria-label="Sign out"
+          style={{ padding: '6px 8px' }}
+        >
+          <LogOut size={14} />
         </button>
       </div>
     </header>

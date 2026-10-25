@@ -2,6 +2,16 @@
 
 NetWatch is a local, full-stack cybersecurity web application designed to analyze network-flow CSV datasets, detect unusual behavioral anomalies across individual hosts, correlate related findings into prioritized security incidents, and assist analysts with evidence-backed forensic investigation.
 
+NetWatch requires account sign-in. Passwords are stored as salted PBKDF2 hashes, and authenticated API access uses signed, HttpOnly session cookies. On Render Free, the SQLite account database is on ephemeral storage and can be lost when the service restarts or spins down; configure durable storage/database before relying on persistent accounts. Investigation datasets also remain in process memory and are not isolated per user.
+
+### Roles and demo access
+
+- **Admin** can access every application feature, manage accounts and role assignments, review the permission matrix and audit log, configure detection settings, and build baselines.
+- **Security Analyst** can upload and analyze traffic, view baseline and investigation data, manage incident status, and export reports. Analyst API requests cannot manage accounts, edit detection settings, or build baselines.
+- API authorization is enforced server-side for every protected route; unclassified API routes are denied. Frontend navigation and page controls reflect the same role capabilities.
+
+There are no built-in demo passwords. To provision an administrator on first startup, configure `NETWATCH_BOOTSTRAP_ADMIN_EMAIL` and `NETWATCH_BOOTSTRAP_ADMIN_PASSWORD` (minimum 12 characters). To show clickable login-page demo accounts, explicitly set `NETWATCH_ENABLE_DEMO_ACCOUNTS=true` and provide `NETWATCH_DEMO_ADMIN_EMAIL`, `NETWATCH_DEMO_ADMIN_PASSWORD`, `NETWATCH_DEMO_ANALYST_EMAIL`, and `NETWATCH_DEMO_ANALYST_PASSWORD`. Demo credentials are only returned by the public demo-account endpoint while this opt-in is enabled and the configured accounts authenticate with the expected roles. Keep demo accounts disabled outside an isolated demo environment.
+
 ---
 
 ## 🛠️ Technical Stack
@@ -68,17 +78,21 @@ NetWatch is a local, full-stack cybersecurity web application designed to analyz
    - **Rule I (Blocked or Failed Connections)**: Abnormal surges in firewall denials or authentication failures.
 5. **Incident Grouping & Deterministic Priority Scoring (0–100)**:
    - Groups related findings by affected host, time window, and attack category.
-   - Calculates transparent investigation priority scores using configurable weights:
-     $$\text{Score} = w_{\text{sev}} S_{\text{sev}} + w_{\text{dev}} S_{\text{dev}} + w_{\text{pers}} S_{\text{pers}} + w_{\text{cat}} S_{\text{cat}}$$
+    - Calculates each incident's deterministic 0-100 risk score from configured severity, deviation, evidence persistence, rule diversity, rule priority, and incident-correlation factors, then applies the trusted-activity multiplier:
+       $$\text{Score} = \operatorname{clamp}_{0..100}\left(\left(\sum_i w_i S_i\right) \times M_{\text{trust}}\right)$$
+    - Shows component points, configured weights, per-rule priority contributions, finding counts, trust adjustment, and supporting flow evidence for each incident.
    - Provides plausible benign explanations and standardized SOC investigation checklists.
    - Keeps findings for audit, but excludes configured approved activities and scheduled maintenance from incident scoring; trusted-server suppression is limited to low-severity findings.
-6. **13 Complete Application Views**:
-   - Dashboard, Upload & Mapping, Data Quality, Baseline & Learning, Traffic Analytics, Host Analysis, Port Heatmap Analysis, DNS Analysis, Cytoscape.js Network Graph, Incidents Queue, Incident Details & Evidence, Detection Settings, and Reports & Exports.
+6. **14 Complete Application Views**:
+   - Dashboard, Upload & Mapping, Data Quality, Baseline & Learning, Traffic Analytics, Host Analysis, Port Heatmap Analysis, DNS Analysis, Cytoscape.js Network Graph, Incidents Queue, Incident Details & Evidence, Detection Settings, Reports & Exports, and Admin & Access Control.
 7. **Forensic Exports**:
    - CSV exports protected against formula injection (`=`, `+`, `-`, `@` prepended with `'`).
    - Standalone HTML forensic intelligence report with fully escaped untrusted text.
 8. **Optional Local Ollama Support**:
    - If a local Ollama instance is running, provides local AI triage assessment; otherwise falls back gracefully to deterministic cybersecurity synthesis.
+9. **Qualcomm AI Evidence Analysis**:
+   - Uses official local GenieX runtime with verified incident rules, risk calculation, and supporting traffic evidence; deterministic results remain available when GenieX is not configured.
+   - Model confidence is reported as unavailable because GenieX chat does not provide a calibrated confidence value.
 
 ---
 
@@ -88,6 +102,7 @@ NetWatch is a local, full-stack cybersecurity web application designed to analyz
 netwatch/
 ├── backend/
 │   ├── main.py                     # FastAPI REST API endpoints
+│   ├── auth.py                     # Password hashing, sessions, roles, and account storage
 │   ├── data_processor.py           # CSV parsing, mapping, validation & baseline computation
 │   ├── detection.py                # 7 rule anomaly engines, incident grouping & deterministic scoring
 │   ├── analytics.py                # Traffic series, port heatmap, host profiling & network graph
@@ -95,13 +110,15 @@ netwatch/
 │   ├── generate_sample.py          # Synthetic dataset generator
 │   ├── requirements.txt            # Python dependencies
 │   └── tests/
-│       └── test_netwatch.py        # Pytest test suite (10 comprehensive tests)
+│       └── test_netwatch.py        # API, role authorization, and analytics test suite
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── Sidebar.jsx         # Navigation sidebar with status indicators
 │   │   │   └── TopBar.jsx          # Header with dataset status & sample loading
 │   │   ├── pages/
+│   │   │   ├── AdminPage.jsx       # Account roles, permission matrix, and audit log
+│   │   │   ├── AuthPage.jsx        # Sign-in, signup, and opt-in demo account autofill
 │   │   │   ├── DashboardPage.jsx   # Metrics, charts, top talkers, incident queue
 │   │   │   ├── UploadPage.jsx      # CSV upload, preview & column mapping
 │   │   │   ├── DataQualityPage.jsx # Audit of valid, rejected & duplicate records
@@ -177,6 +194,33 @@ Open `http://localhost:5173` in your browser.
 
 ---
 
+## Deploy on Render Free
+
+The repository includes a single-service Docker deployment. Render builds the Vite frontend, copies it into the FastAPI image, and serves the UI and `/api` from the same origin.
+
+1. Push this repository to GitHub.
+2. In Render, choose **New > Blueprint**, connect the GitHub repository, and deploy the root `render.yaml`.
+3. Wait for the first build, then open the `onrender.com` URL and the direct `/login` URL. Both should serve the React app; Render checks `/api/health`.
+
+Render generates `NETWATCH_SESSION_SECRET` through `render.yaml`; do not commit session secrets or passwords. Local development generates a process-local session secret unless `NETWATCH_SESSION_SECRET` is set.
+
+For local demo logins, set the demo-account environment variables above before starting the backend. The login screen fills the selected account credentials only; the user must still submit **Sign in**. Set `NETWATCH_CORS_ORIGINS` to a comma-separated list of trusted frontend origins when the frontend and API are served from different origins. Same-origin deployments need no extra CORS origins.
+
+No production frontend API URL or secret is required. Optional Qualcomm GenieX stays pending on Render Free: it requires a local supported Qualcomm device and loopback server, which a generic Render container does not provide.
+
+**Render Free limitations:** the web service spins down after 15 minutes without inbound traffic and can take about a minute to wake. Its filesystem is ephemeral, and NetWatch currently keeps uploaded datasets, baselines, findings, and incidents in process memory. They are lost on restarts, deploys, or spin-down and aren't shared across instances. This setup is suitable for demos/testing, not durable multi-user production. Durable storage requires a backend persistence design; Render Free Postgres expires after 30 days and is not a permanent free production store.
+
+To smoke-test the production image locally:
+
+```powershell
+docker build -t netwatch .
+docker run --rm -p 10000:10000 netwatch
+```
+
+Then open `http://localhost:10000` and check `http://localhost:10000/api/health`.
+
+---
+
 ## Workflow Guide
 
 ### 1. Load Synthetic Demonstration Dataset
@@ -228,6 +272,33 @@ Open `http://localhost:5173` in your browser.
 - Regression scenarios assert detection of a suspicious horizontal sweep and internal spread, while an authorized scanner retains an auditable finding but creates no scored incident. This is scenario-based validation, not a statistically representative production accuracy estimate.
 - Limitations: configured internal networks are prefix-based; maintenance schedules use local timestamps treated as UTC; approved source identities are IP-based and should be tightly controlled. Encrypted payloads and process-level attribution are outside flow-log visibility.
 
+### Mission 03 Notes
+- Host Analysis compares evaluation-period connection rate, bytes sent, average flow size, destination diversity, and failure rate against the host's learning baseline.
+- Traffic Analytics marks actionable findings by time bucket and shows the observed measurement, configured threshold, and rule explanation. Approved/scheduled activity remains visible but is visually distinguished.
+- Beacon findings include each supporting connection timestamp and measured inter-arrival gap, with mean interval, standard deviation, and coefficient of variation.
+- Incident timelines label likely behavioral stages; incident detail includes a communication graph built from that incident's supporting flow records and score/rule/evidence breakdowns.
+- Regression scenarios compare a suspicious regular beacon against a configured periodic log-aggregation service to validate false-positive handling.
+
+### Qualcomm GenieX Setup
+Qualcomm AI Hub lists [Qwen3-4B-Instruct-2507](https://aihub.qualcomm.com/models/qwen3_4b_instruct_2507) as an instruction-following model and documents its GenieX deployment path. GenieX provides a local OpenAI-compatible server; AI Hub Workbench is used for device compile/profile/inference jobs, not as a generic hosted chat endpoint. NetWatch only connects to loopback addresses.
+
+1. On a supported Qualcomm Windows ARM device, install the [GenieX CLI](https://geniex.aihub.qualcomm.com/en/run/cli/install/).
+2. Pull the model and start the local server:
+
+```powershell
+geniex pull ai-hub-models/Qwen3-4B-Instruct-2507
+geniex serve
+```
+
+3. In the backend's PowerShell session, configure the local endpoint and model before starting/restarting NetWatch:
+
+```powershell
+$env:QUALCOMM_GENIEX_BASE_URL = "http://127.0.0.1:18181/v1"
+$env:QUALCOMM_GENIEX_MODEL = "ai-hub-models/Qwen3-4B-Instruct-2507"
+```
+
+The local GenieX server does not require an API token. If a local authenticated proxy is used, set `QUALCOMM_GENIEX_API_KEY` in the backend environment; it is never returned to or used by the frontend. Without a running local GenieX server, NetWatch labels the integration pending/unavailable and continues to show only verified detector results. AI narrative is advisory and does not alter risk scores or claim model confidence.
+
 ### Backend Pytest Suite
 Run the backend test suite from the project root:
 
@@ -236,19 +307,6 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch
 .venv\Scripts\pytest backend\tests -v
 ```
 
-## 🔄 System Workflow
-
-1. **Data Ingestion** – Upload network-flow CSV files through the dashboard.
-2. **Data Processing** – Validate and process the uploaded records using Python.
-3. **Behavioral Analysis** – Establish or use historical traffic baselines to understand normal activity.
-4. **Anomaly Detection** – Apply configurable rules to identify suspicious traffic patterns.
-5. **Incident Assessment** – Correlate findings and prioritize suspicious activities for investigation.
-6. **Visualization** – Display traffic analytics, anomalies, and network relationships.
-7. **Report Generation** – Export investigation results in CSV or HTML format.
-
----
-
-**Results (13/13 Passed)**:
 - `test_suggest_column_mapping` (Auto-aliasing of common flow headers)
 - `test_zeek_schema_maps_to_canonical_fields_and_matches_default` (Alternate field names normalize to the canonical flow schema)
 - `test_zeek_tsv_upload_auto_maps_columns` (Tab-delimited upload selects the configured schema profile)
@@ -260,6 +318,11 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch
 - `test_sweep_lateral_detection_and_legitimate_activity_suppression` (Suspicious sweep/spread detection and authorized scanner false-positive reduction)
 - `test_missing_dns_and_outcome_fields` (Graceful handling without data fabrication)
 - `test_incident_grouping_and_scoring` (Correlation and deterministic formula calculation)
+- `test_incident_score_uses_configured_rule_and_trusted_activity_weights` (Configured rule priority, correlation gain, and trusted multiplier)
+- `test_incident_severity_score_boundaries` (Low/Medium/High/Critical score-band boundaries)
+- `test_qualcomm_analysis_returns_verified_results_when_runtime_is_pending` (Evidence-grounded pending response with no fabricated AI result)
+- `test_qualcomm_rejects_remote_runtime_urls` (Local-only GenieX endpoint enforcement)
+- `test_analytics_include_destination_hosts_dns_flows_and_nonempty_buckets` (Analytics reflect both flow endpoints, DNS transport, nonempty time bins, and incident edges)
 - `test_configuration_validation` (Settings schema and weight sum validation)
 - `test_api_sample_load_and_workflow` (End-to-end integration test of all API routes and exports)
 

@@ -1,6 +1,7 @@
 import os
 import io
 import sys
+import uuid
 import pytest
 import pandas as pd
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ if "config" in sys.modules and not hasattr(sys.modules["config"], "load_settings
 
 from fastapi.testclient import TestClient
 try:
+    import backend.main as main_module
     from backend.config import load_settings, save_settings, validate_settings, DEFAULT_SETTINGS
     from backend.data_processor import (
         suggest_column_mapping,
@@ -35,8 +37,10 @@ try:
         get_dns_analysis,
         build_network_graph
     )
+    from backend.auth import ADMIN_ROLE, ANALYST_ROLE, bootstrap_configured_accounts, create_account, configured_demo_accounts
     from backend.main import app, state
 except ImportError:
+    import main as main_module
     from config import load_settings, save_settings, validate_settings, DEFAULT_SETTINGS
     from data_processor import (
         suggest_column_mapping,
@@ -60,13 +64,170 @@ except ImportError:
         get_dns_analysis,
         build_network_graph
     )
+    from auth import ADMIN_ROLE, ANALYST_ROLE, bootstrap_configured_accounts, create_account, configured_demo_accounts
     from main import app, state
 
 
 @pytest.fixture
 def client():
     state.reset()
-    return TestClient(app)
+    test_client = TestClient(app)
+    email = f"netwatch-test-{uuid.uuid4().hex}@example.test"
+    password = "Test-Suite-Password-2026!"
+    create_account(email, password, ADMIN_ROLE)
+    login_response = test_client.post("/api/auth/login", json={
+        "email": email,
+        "password": password
+    })
+    assert login_response.status_code == 200
+    return test_client
+
+
+def test_authentication_signup_login_and_protected_api():
+    anonymous_client = TestClient(app)
+    assert anonymous_client.get("/api/dashboard").status_code == 401
+    email = f"auth-{uuid.uuid4().hex}@example.test"
+    password = "Long-Enough-Test-Password-2035!"
+
+    signup = anonymous_client.post("/api/auth/signup", json={"email": email, "password": password})
+    assert signup.status_code == 201
+    assert signup.json()["user"]["email"] == email
+    assert "password" not in signup.json()["user"]
+    assert anonymous_client.get("/api/dashboard").status_code == 401
+
+    assert anonymous_client.post("/api/auth/login", json={
+        "email": email,
+        "password": "incorrect-password"
+    }).status_code == 401
+    login = anonymous_client.post("/api/auth/login", json={"email": email, "password": password})
+    assert login.status_code == 200
+    assert "httponly" in login.headers["set-cookie"].lower()
+    assert anonymous_client.get("/api/auth/session").json()["authenticated"] is True
+    assert anonymous_client.get("/api/dashboard").status_code == 200
+    assert anonymous_client.post("/api/auth/logout").status_code == 200
+    assert anonymous_client.get("/api/dashboard").status_code == 401
+
+
+def test_frontend_routes_serve_spa_and_built_assets(monkeypatch, tmp_path):
+    dist_dir = tmp_path / "dist"
+    assets_dir = dist_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    index_file = dist_dir / "index.html"
+    index_file.write_text('<div id="root">NetWatch</div>', encoding="utf-8")
+    asset_file = assets_dir / "app.js"
+    asset_file.write_text("console.log('NetWatch');", encoding="utf-8")
+    monkeypatch.setattr(main_module, "FRONTEND_DIST_DIR", str(dist_dir))
+    monkeypatch.setattr(main_module, "FRONTEND_INDEX", str(index_file))
+
+    test_client = TestClient(app)
+    assert test_client.get("/login").text == '<div id="root">NetWatch</div>'
+    assert test_client.get("/assets/app.js").text == "console.log('NetWatch');"
+    assert test_client.get("/assets/missing.js").status_code == 404
+    assert test_client.get("/api/health").status_code == 200
+
+
+def test_signup_rejects_weak_password():
+    response = TestClient(app).post("/api/auth/signup", json={
+        "email": f"weak-{uuid.uuid4().hex}@example.test",
+        "password": "short"
+    })
+    assert response.status_code == 400
+    assert "12 characters" in response.json()["detail"]
+
+
+def test_role_permissions_enforced_for_admin_and_analyst():
+    state.reset()
+    admin_email = f"admin-{uuid.uuid4().hex}@example.test"
+    admin_password = "Long-Enough-Admin-Password-2035!"
+    analyst_email = f"analyst-{uuid.uuid4().hex}@example.test"
+    analyst_password = "Long-Enough-Analyst-Password-2035!"
+    create_account(admin_email, admin_password, ADMIN_ROLE)
+
+    admin_client = TestClient(app)
+    admin_login = admin_client.post("/api/auth/login", json={
+        "email": admin_email,
+        "password": admin_password
+    })
+    assert admin_login.status_code == 200
+    assert "*" in admin_login.json()["user"]["permissions"]
+    assert admin_client.get("/api/admin/users").status_code == 200
+    assert admin_client.get("/api/admin/permissions").status_code == 200
+    assert admin_client.get("/api/admin/audit").status_code == 200
+    assert admin_client.get("/api/config").status_code == 200
+    assert admin_client.get("/api/baseline").status_code == 200
+    assert admin_client.post("/api/baseline/build", json={
+        "learning_start": "2026-01-01",
+        "learning_end": "2026-01-02"
+    }).status_code == 400
+
+    created = admin_client.post("/api/admin/users", json={
+        "email": analyst_email,
+        "password": analyst_password,
+        "role": ANALYST_ROLE
+    })
+    assert created.status_code == 201
+    analyst = created.json()["user"]
+    assert analyst["role"] == ANALYST_ROLE
+    assert "password" not in analyst
+
+    analyst_client = TestClient(app)
+    analyst_login = analyst_client.post("/api/auth/login", json={
+        "email": analyst_email,
+        "password": analyst_password
+    })
+    assert analyst_login.status_code == 200
+    analyst_permissions = analyst_login.json()["user"]["permissions"]
+    assert "incidents:manage" in analyst_permissions
+    assert "baseline:view" in analyst_permissions
+    assert "baseline:build" not in analyst_permissions
+    assert analyst_client.get("/api/admin/users").status_code == 403
+    assert analyst_client.get("/api/config").status_code == 403
+
+    assert admin_client.patch(f"/api/admin/users/{analyst['id']}/role", json={
+        "role": ADMIN_ROLE
+    }).status_code == 200
+    assert analyst_client.get("/api/admin/users").status_code == 200
+    assert admin_client.patch(f"/api/admin/users/{analyst['id']}/role", json={
+        "role": ANALYST_ROLE
+    }).status_code == 200
+    assert analyst_client.get("/api/admin/users").status_code == 403
+    assert admin_client.patch(f"/api/admin/users/{analyst['id']}/role", json={
+        "role": "unknown"
+    }).status_code == 400
+    assert admin_client.get("/api/admin/audit").json()["events"]
+
+    assert analyst_client.get("/api/baseline").json()["available"] is False
+    assert analyst_client.post("/api/baseline/build", json={
+        "learning_start": "2026-01-01",
+        "learning_end": "2026-01-02"
+    }).status_code == 403
+    assert analyst_client.patch("/api/incidents/unknown/status", json={
+        "status": "resolved"
+    }).status_code == 404
+    assert admin_client.get("/api/not-a-real-endpoint").status_code == 403
+    assert admin_client.get("/api/admin/users").json()["users"]
+
+
+def test_demo_accounts_are_opt_in_and_environment_configured(monkeypatch, tmp_path):
+    demo_admin_email = f"demo-admin-{uuid.uuid4().hex}@example.test"
+    demo_analyst_email = f"demo-analyst-{uuid.uuid4().hex}@example.test"
+    monkeypatch.setenv("NETWATCH_AUTH_DB", str(tmp_path / "demo-auth.sqlite3"))
+    monkeypatch.setenv("NETWATCH_ENABLE_DEMO_ACCOUNTS", "true")
+    monkeypatch.setenv("NETWATCH_DEMO_ADMIN_EMAIL", demo_admin_email)
+    monkeypatch.setenv("NETWATCH_DEMO_ADMIN_PASSWORD", "Long-Enough-Demo-Admin-2035!")
+    monkeypatch.setenv("NETWATCH_DEMO_ANALYST_EMAIL", demo_analyst_email)
+    monkeypatch.setenv("NETWATCH_DEMO_ANALYST_PASSWORD", "Long-Enough-Demo-Analyst-2035!")
+
+    bootstrap_configured_accounts()
+    accounts = configured_demo_accounts()
+    assert {account["role"] for account in accounts} == {ADMIN_ROLE, ANALYST_ROLE}
+    assert {account["email"] for account in accounts} == {demo_admin_email, demo_analyst_email}
+    response_accounts = TestClient(app).get("/api/auth/demo-accounts")
+    assert response_accounts.status_code == 200
+    assert {account["role"] for account in response_accounts.json()["accounts"]} == {ADMIN_ROLE, ANALYST_ROLE}
+
+    monkeypatch.setenv("NETWATCH_ENABLE_DEMO_ACCOUNTS", "false")
+    assert configured_demo_accounts() == []
 
 
 # -----------------------------------------------------------------------------
@@ -187,6 +348,15 @@ def test_uploaded_custom_dataset_populates_dashboard_analysis(client):
     assert dashboard["severity_score_thresholds"] == load_settings()["scoring"]["score_thresholds"]
     assert sum(dashboard["severity_distribution"].values()) == dashboard["total_incidents"]
     assert dashboard["top_ports"][0]["port"] == 9443
+    host_comparison = client.get("/api/analytics/host/203.0.113.10").json()["behavior_comparison"]
+    assert host_comparison["learning_window"]
+    assert host_comparison["evaluation_window"]
+    assert {metric["key"] for metric in host_comparison["metrics"]} >= {
+        "connections_per_hour", "bytes_sent_per_hour", "failed_rate"
+    }
+    traffic = client.get("/api/analytics/traffic?interval=5").json()
+    assert traffic["anomaly_markers"]
+    assert sum(bucket["anomaly_count"] for bucket in traffic["time_series"]) > 0
     preview = client.get("/api/dataset/preview").json()
     assert preview["dataset_name"] == "custom_flows.csv"
     assert preview["quality_summary"]["valid_records"] == 24
@@ -464,6 +634,54 @@ def test_analytics_include_destination_hosts_dns_flows_and_nonempty_buckets():
     assert graph["summary"]["incident_edges"] == 1
 
 
+def test_beacon_timeline_and_approved_periodic_false_positive():
+    cfg = load_settings()
+    for rule_name, rule_cfg in cfg["rules"].items():
+        rule_cfg["enabled"] = rule_name == "periodic_connections"
+    cfg["rules"]["periodic_connections"]["min_occurrences"] = 5
+    start = datetime(2026, 10, 5, 10, 0)
+    rows = []
+    record_id = 1
+    hosts = [
+        ("203.0.113.80", "198.51.100.44", 8443),
+        ("192.168.1.180", "192.168.1.50", 514)
+    ]
+    for source, destination, port in hosts:
+        for index in range(6):
+            rows.append({
+                "record_id": record_id,
+                "timestamp": start + timedelta(seconds=index * 60),
+                "src_ip": source,
+                "dst_ip": destination,
+                "src_port": 50000 + record_id,
+                "dst_port": port,
+                "protocol": "TCP",
+                "bytes_sent": 500,
+                "bytes_received": 100,
+                "packets": 4,
+                "duration": 0.5,
+                "action": "ALLOW",
+                "dns_query": "",
+                "label": ""
+            })
+            record_id += 1
+
+    findings = detect_anomalies(
+        pd.DataFrame(rows), {"host_baselines": {}, "all_observed_pairs": []}, cfg
+    )
+    suspicious = next(finding for finding in findings if finding["affected_host"] == "203.0.113.80")
+    approved = next(finding for finding in findings if finding["affected_host"] == "192.168.1.180")
+    assert suspicious["rule_id"] == "RULE_BEACONING"
+    assert suspicious["is_suppressed"] is False
+    assert suspicious["beaconing_metrics"]["coefficient_of_variation"] == 0
+    assert [item["gap_seconds"] for item in suspicious["connection_timeline"]] == [None, 60, 60, 60, 60, 60]
+    assert approved["is_suppressed"] is True
+    assert approved["approved_activity_name"] == "Nightly Log Aggregation Agent"
+    incidents = group_findings_into_incidents(findings, cfg)
+    assert [incident["affected_hosts"] for incident in incidents] == [["203.0.113.80"]]
+    assert incidents[0]["timeline"][0]["attack_stage"] == "Command and Control"
+
+
 def test_sweep_lateral_detection_and_legitimate_activity_suppression():
     cfg = load_settings()
     cfg["rules"]["port_probing"]["enabled"] = False
@@ -577,6 +795,87 @@ def test_incident_grouping_and_scoring():
     assert 0 <= inc["score"] <= 100
     assert "deterministic" in inc["score_explanation"].lower() or "score" in inc["score_explanation"].lower()
     assert inc["severity"] in ["High", "Critical"]
+    assert len(inc["contributing_rules"]) == 2
+    assert inc["score_breakdown"]["correlation_score"] > 0
+    assert abs(
+        sum(rule["weighted_points"] for rule in inc["contributing_rules"])
+        - inc["score_breakdown"]["component_points"]["rule_priority"]
+    ) < 0.02
+
+
+def test_incident_score_uses_configured_rule_and_trusted_activity_weights():
+    scoring = load_settings()["scoring"]
+    findings = [{
+        "rule_id": "RULE_PORT_PROBE",
+        "rule_name": "Port Probing",
+        "severity": "High",
+        "deviation_ratio": 2.0,
+        "supporting_record_ids": [1, 2],
+    }]
+    baseline_score, _, baseline_breakdown = calculate_incident_score(findings, scoring)
+
+    correlated = findings + [{
+        "rule_id": "RULE_BLOCKED_CONNS",
+        "rule_name": "Blocked Connections",
+        "severity": "High",
+        "deviation_ratio": 2.5,
+        "supporting_record_ids": [3, 4],
+    }]
+    correlated_score, _, correlated_breakdown = calculate_incident_score(correlated, scoring)
+    assert correlated_score > baseline_score
+    assert correlated_breakdown["correlation_score"] > baseline_breakdown["correlation_score"]
+    assert {rule["rule_id"] for rule in correlated_breakdown["rule_contributions"]} == {
+        "RULE_PORT_PROBE", "RULE_BLOCKED_CONNS"
+    }
+
+    adjusted = [dict(correlated[0], trusted_activity_adjustment_multiplier=0.5)] + correlated[1:]
+    adjusted_score, _, adjusted_breakdown = calculate_incident_score(adjusted, scoring)
+    assert adjusted_breakdown["trusted_activity_multiplier"] == 0.5
+    assert adjusted_score == round(adjusted_breakdown["raw_weighted_total"] * 0.5)
+
+
+def test_incident_severity_score_boundaries():
+    thresholds = load_settings()["scoring"]["score_thresholds"]
+    expected = {
+        0: "Low", 35: "Low", 36: "Medium", 65: "Medium",
+        66: "High", 85: "High", 86: "Critical", 100: "Critical"
+    }
+    assert {score: get_incident_severity(score, thresholds) for score in expected} == expected
+
+
+def test_qualcomm_analysis_returns_verified_results_when_runtime_is_pending(client, monkeypatch):
+    monkeypatch.delenv("QUALCOMM_GENIEX_BASE_URL", raising=False)
+    monkeypatch.delenv("QUALCOMM_GENIEX_API_KEY", raising=False)
+    assert client.post("/api/sample/load").status_code == 200
+    incidents = client.get("/api/incidents").json()["incidents"]
+    assert incidents
+    incident = incidents[0]
+
+    response = client.get(f"/api/incidents/{incident['incident_id']}/qualcomm-analysis")
+    assert response.status_code == 200
+    result = response.json()
+    assert result["provider"] == "Qualcomm AI Hub / GenieX"
+    assert result["integration_status"] == "pending"
+    assert result["model"] == "ai-hub-models/Qwen3-4B-Instruct-2507"
+    assert result["ai_assessment"] is None
+    assert result["model_confidence"] is None
+    assert result["verified_analysis"]["risk_assessment"]["score"] == incident["score"]
+    assert result["verified_analysis"]["validation"]["checks"]["overall"] == "verified"
+    assert result["verified_analysis"]["evidence"]["returned_record_count"] > 0
+
+    response = client.post(f"/api/incidents/{incident['incident_id']}/qualcomm-analysis")
+    assert response.status_code == 200
+    assert response.json()["ai_assessment"] is None
+
+
+def test_qualcomm_rejects_remote_runtime_urls(client, monkeypatch):
+    monkeypatch.setenv("QUALCOMM_GENIEX_BASE_URL", "https://example.com/v1")
+    assert client.post("/api/sample/load").status_code == 200
+    incident = client.get("/api/incidents").json()["incidents"][0]
+    result = client.get(f"/api/incidents/{incident['incident_id']}/qualcomm-analysis").json()
+    assert result["integration_status"] == "unavailable"
+    assert "loopback" in result["status_message"]
+    assert result["ai_assessment"] is None
 
 
 # -----------------------------------------------------------------------------
@@ -615,6 +914,10 @@ def test_api_sample_load_and_workflow(client):
     assert loaded_dashboard["total_findings"] == data["auto_analysis"]["total_findings"]
     assert loaded_dashboard["total_incidents"] == data["auto_analysis"]["total_incidents"]
     assert sum(loaded_dashboard["severity_distribution"].values()) == loaded_dashboard["total_incidents"]
+    traffic_result = client.get("/api/analytics/traffic?interval=5").json()
+    assert traffic_result["anomaly_markers"]
+    assert any(marker["is_suppressed"] for marker in traffic_result["anomaly_markers"])
+    assert any(bucket["anomaly_count"] > 0 for bucket in traffic_result["time_series"])
 
     # 3. Get time range
     res = client.get("/api/dataset/time-range")
@@ -671,13 +974,32 @@ def test_api_sample_load_and_workflow(client):
     incs = res.json()["incidents"]
     assert len(incs) > 0
     first_inc_id = incs[0]["incident_id"]
+    assert incs[0]["status"] == "open"
+    status_update = client.patch(f"/api/incidents/{first_inc_id}/status", json={"status": "acknowledged"})
+    assert status_update.status_code == 200
+    assert client.get(f"/api/incidents/{first_inc_id}").json()["status"] == "acknowledged"
+    assert client.patch(f"/api/incidents/{first_inc_id}/status", json={"status": "invalid"}).status_code == 400
+    incident_export = client.get("/api/export/incidents")
+    assert "Status" in incident_export.text
+    assert "acknowledged" in incident_export.text
 
     res = client.get(f"/api/incidents/{first_inc_id}")
     assert res.status_code == 200
+    incident_detail = res.json()
+    assert incident_detail["timeline"]
+    assert all(event.get("attack_stage") for event in incident_detail["timeline"])
+    assert incident_detail["attack_stages"]
 
     res = client.get(f"/api/incidents/{first_inc_id}/evidence")
     assert res.status_code == 200
     assert len(res.json()["records"]) > 0
+
+    res = client.get(f"/api/incidents/{first_inc_id}/graph")
+    assert res.status_code == 200
+    assert res.json()["incident_id"] == first_inc_id
+    assert len(res.json()["elements"]["nodes"]) > 0
+    assert len(res.json()["elements"]["edges"]) > 0
+    assert res.json()["summary"]["incident_edges"] > 0
 
     # 10. AI / Rule explanation
     res = client.post(f"/api/incidents/{first_inc_id}/ai-explain")

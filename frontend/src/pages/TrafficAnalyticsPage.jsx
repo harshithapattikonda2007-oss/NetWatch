@@ -19,6 +19,7 @@ import {
   CartesianGrid,
   Tooltip,
   Legend,
+  ReferenceDot,
   ResponsiveContainer
 } from 'recharts';
 import { api } from '../services/api';
@@ -123,10 +124,46 @@ export default function TrafficAnalyticsPage({ dataRevision }) {
                   <Legend wrapperStyle={{ paddingTop: 10 }} />
                   <Area type="monotone" dataKey="bytes_sent" name="Bytes Sent" stroke="#38bdf8" fill="url(#areaSent)" />
                   <Area type="monotone" dataKey="bytes_received" name="Bytes Received" stroke="#818cf8" fill="url(#areaRecv)" />
+                  {trafficData.time_series.filter((bucket) => bucket.anomaly_count > 0 || bucket.approved_activity_count > 0).map((bucket) => (
+                    <ReferenceDot
+                      key={`anomaly-${bucket.timestamp}`}
+                      x={bucket.timestamp}
+                      y={Math.max(bucket.bytes_sent, bucket.bytes_received)}
+                      r={6}
+                      fill={bucket.anomaly_count > 0 ? '#ef4444' : '#10b981'}
+                      stroke="#fff"
+                      ifOverflow="visible"
+                    />
+                  ))}
                 </AreaChart>
               </ResponsiveContainer>
             </div>
           </div>
+
+          {(trafficData.anomaly_markers || []).length > 0 && (
+            <div className="card" style={{ marginBottom: 24 }}>
+              <div className="card-title">Traffic Deviations & Trigger Measurements ({trafficData.anomaly_markers.length})</div>
+              <div className="table-container">
+                <table className="data-table">
+                  <thead>
+                    <tr><th>Time</th><th>Host</th><th>Rule</th><th>Observed</th><th>Trigger Threshold</th><th>Explanation</th></tr>
+                  </thead>
+                  <tbody>
+                    {trafficData.anomaly_markers.map((finding) => (
+                      <tr key={finding.finding_id}>
+                        <td className="mono">{finding.timestamp}</td>
+                        <td className="mono">{finding.affected_host}</td>
+                        <td>{finding.rule_name}{finding.is_suppressed && <span className="badge badge-approved" style={{ marginLeft: 6 }}>Approved</span>}</td>
+                        <td>{finding.observed_value}</td>
+                        <td>{finding.baseline_threshold}</td>
+                        <td>{finding.is_suppressed ? finding.suppression_reason : finding.explanation}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {/* Chart 2: Connections & Packet Velocity */}
           <div className="card" style={{ marginBottom: 24 }}>

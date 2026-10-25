@@ -80,10 +80,12 @@ baseline:
 
 scoring:
   weights:
-    severity: 0.35
-    deviation: 0.25
-    persistence: 0.20
-    category_diversity: 0.20
+    severity: 0.30
+    deviation: 0.20
+    persistence: 0.15
+    category_diversity: 0.15
+    rule_priority: 0.10
+    correlation: 0.10
   severity_base_points:
     Low: 20
     Medium: 45
@@ -94,6 +96,34 @@ scoring:
     Medium: 65
     High: 85
     Critical: 100
+  rule_weights:
+    RULE_DATA_TRANSFER: 85
+    RULE_PORT_PROBE: 75
+    RULE_NETWORK_SWEEP: 80
+    RULE_DEST_DIVERSITY: 55
+    RULE_LATERAL_MOVEMENT: 90
+    RULE_BEACONING: 90
+    RULE_UNEXPECTED_COMM: 60
+    RULE_DNS_ANOMALY: 80
+    RULE_BLOCKED_CONNS: 50
+  default_rule_weight: 50
+  category_diversity_points:
+    "0": 0
+    "1": 35
+    "2": 70
+    "3": 100
+  category_diversity_max_points: 100
+  deviation_saturation_ratio: 5.0
+  deviation_base_points: 30.0
+  deviation_points_per_ratio: 17.5
+  persistence_saturation_records: 20
+  persistence_base_points: 25.0
+  persistence_points_per_log2_record: 15.0
+  correlation_points_per_additional_finding: 55
+  trusted_activity_multipliers:
+    approved_activity: 0.0
+    maintenance: 0.0
+    trusted_server: 0.8
 
 upload:
   max_file_size_mb: 50

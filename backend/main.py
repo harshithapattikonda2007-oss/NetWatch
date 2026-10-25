@@ -2,11 +2,16 @@ import io
 import os
 import csv
 import html
+import json
 import httpx
 import pandas as pd
+import secrets
+from urllib.parse import urlsplit
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -23,6 +28,22 @@ if "config" in sys.modules and not hasattr(sys.modules["config"], "load_settings
     del sys.modules["config"]
 
 try:
+    from .auth import (
+        SESSION_TTL_SECONDS,
+        ADMIN_ROLE,
+        ANALYST_ROLE,
+        authenticate_account,
+        bootstrap_configured_accounts,
+        change_account_role,
+        configured_demo_accounts,
+        create_account,
+        create_session_token,
+        get_session_user,
+        list_accounts,
+        list_audit_events,
+        permissions_for_role,
+        write_audit_event
+    )
     from .config import load_settings, save_settings, validate_settings
     from .data_processor import (
         suggest_column_mapping,
@@ -45,6 +66,22 @@ try:
     )
 except ImportError:
     try:
+        from backend.auth import (
+            SESSION_TTL_SECONDS,
+            ADMIN_ROLE,
+            ANALYST_ROLE,
+            authenticate_account,
+            bootstrap_configured_accounts,
+            change_account_role,
+            configured_demo_accounts,
+            create_account,
+            create_session_token,
+            get_session_user,
+            list_accounts,
+            list_audit_events,
+            permissions_for_role,
+            write_audit_event
+        )
         from backend.config import load_settings, save_settings, validate_settings
         from backend.data_processor import (
             suggest_column_mapping,
@@ -66,6 +103,22 @@ except ImportError:
             build_network_graph
         )
     except ImportError:
+        from auth import (
+            SESSION_TTL_SECONDS,
+            ADMIN_ROLE,
+            ANALYST_ROLE,
+            authenticate_account,
+            bootstrap_configured_accounts,
+            change_account_role,
+            configured_demo_accounts,
+            create_account,
+            create_session_token,
+            get_session_user,
+            list_accounts,
+            list_audit_events,
+            permissions_for_role,
+            write_audit_event
+        )
         from config import load_settings, save_settings, validate_settings
         from data_processor import (
             suggest_column_mapping,
@@ -93,14 +146,91 @@ app = FastAPI(
     version="1.0.0"
 )
 
+bootstrap_configured_accounts()
+
 # Enable CORS for local Vite dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "NETWATCH_CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173"
+        ).split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+AUTH_SESSION_SECRET = os.getenv("NETWATCH_SESSION_SECRET") or secrets.token_urlsafe(48)
+AUTH_COOKIE_NAME = "netwatch_session"
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/auth/signup",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/session",
+    "/api/auth/demo-accounts"
+}
+
+
+def permission_for_api(path: str, method: str) -> Optional[str]:
+    if path.startswith("/api/admin/"):
+        return "admin:manage"
+    if path == "/api/config":
+        return "admin:settings"
+    if method == "POST" and path in {"/api/upload", "/api/sample/load", "/api/dataset/map-and-validate"}:
+        return "dataset:upload"
+    if method == "POST" and path == "/api/baseline/build":
+        return "baseline:build"
+    if method == "GET" and path == "/api/baseline":
+        return "baseline:view"
+    if method == "POST" and path == "/api/analysis/run":
+        return "analysis:run"
+    if method == "PATCH" and path.startswith("/api/incidents/") and path.endswith("/status"):
+        return "incidents:manage"
+    if method == "GET" and path == "/api/findings":
+        return "findings:view"
+    if method == "GET" and (path == "/api/incidents" or path.startswith("/api/incidents/")):
+        return "incidents:view"
+    if method == "POST" and path.startswith("/api/incidents/") and path.endswith(("/qualcomm-analysis", "/ai-explain")):
+        return "incidents:view"
+    if method == "GET" and path.startswith("/api/export/"):
+        return "reports:export"
+    if method == "GET" and (
+        path in {
+            "/api/analytics/traffic",
+            "/api/analytics/hosts",
+            "/api/analytics/ports",
+            "/api/analytics/dns",
+            "/api/dataset/preview",
+            "/api/dataset/time-range",
+            "/api/data-quality",
+            "/api/dashboard",
+            "/api/graph"
+        }
+        or path.startswith("/api/analytics/host/")
+    ):
+        return "analytics:view"
+    return None
+
+
+@app.middleware("http")
+async def require_api_session(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in PUBLIC_API_PATHS and request.method != "OPTIONS":
+        user = get_session_user(request.cookies.get(AUTH_COOKIE_NAME), AUTH_SESSION_SECRET)
+        if user is None:
+            return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        permission = permission_for_api(path, request.method)
+        if permission is None or (
+            "*" not in user["permissions"] and permission not in user["permissions"]
+        ):
+            return JSONResponse({"detail": "This role is not permitted to perform this action"}, status_code=403)
+        request.state.user = user
+    return await call_next(request)
 
 
 # In-Memory State for Active Investigation Session
@@ -114,6 +244,7 @@ class ApplicationState:
         self.baseline: Optional[Dict[str, Any]] = None
         self.findings: List[Dict[str, Any]] = []
         self.incidents: List[Dict[str, Any]] = []
+        self.incident_status: Dict[str, str] = {}
         self.analysis_complete: bool = False
         self.analysis_message: Optional[str] = None
         self.evaluation_records: int = 0
@@ -220,6 +351,23 @@ class AnalysisRequest(BaseModel):
     eval_end: str
 
 
+class AuthCredentials(BaseModel):
+    email: str
+    password: str
+
+
+class RoleUpdateRequest(BaseModel):
+    role: str
+
+
+class AdminAccountCreateRequest(AuthCredentials):
+    role: str = ANALYST_ROLE
+
+
+class IncidentStatusRequest(BaseModel):
+    status: str
+
+
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
@@ -236,6 +384,99 @@ def health_check():
         "baseline_ready": state.baseline is not None,
         "analysis_ready": state.analysis_complete
     }
+
+
+@app.post("/api/auth/signup", status_code=201)
+def signup(req: AuthCredentials):
+    try:
+        user = create_account(req.email, req.password)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    write_audit_event("account_created", user, user["email"], {"role": user["role"]})
+    return {"success": True, "user": user, "message": "Account created. Sign in to continue."}
+
+
+@app.post("/api/auth/login")
+def login(req: AuthCredentials, request: Request):
+    user = authenticate_account(req.email, req.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Email or password is incorrect")
+
+    token = create_session_token(user, AUTH_SESSION_SECRET)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    secure_cookie = request.url.scheme == "https" or forwarded_proto == "https"
+    response = JSONResponse({"success": True, "user": user})
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="strict",
+        path="/"
+    )
+    write_audit_event("login", user, user["email"])
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request):
+    user = get_session_user(request.cookies.get(AUTH_COOKIE_NAME), AUTH_SESSION_SECRET)
+    if user:
+        write_audit_event("logout", user, user["email"])
+    response = JSONResponse({"success": True})
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/", httponly=True, samesite="strict")
+    return response
+
+
+@app.get("/api/auth/session")
+def auth_session(request: Request):
+    user = get_session_user(request.cookies.get(AUTH_COOKIE_NAME), AUTH_SESSION_SECRET)
+    return {"authenticated": user is not None, "user": user}
+
+
+@app.get("/api/auth/demo-accounts")
+def get_demo_accounts(response: Response):
+    accounts = configured_demo_accounts()
+    response.headers["Cache-Control"] = "no-store"
+    return {"enabled": bool(accounts), "accounts": accounts}
+
+
+@app.get("/api/admin/permissions")
+def get_role_permissions():
+    return {"roles": {ADMIN_ROLE: permissions_for_role(ADMIN_ROLE), ANALYST_ROLE: permissions_for_role(ANALYST_ROLE)}}
+
+
+@app.get("/api/admin/users")
+def get_admin_users():
+    return {"users": list_accounts()}
+
+
+@app.post("/api/admin/users", status_code=201)
+def create_admin_user(req: AdminAccountCreateRequest, request: Request):
+    try:
+        user = create_account(req.email, req.password, req.role)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    write_audit_event("account_created_by_admin", request.state.user, user["email"], {"role": user["role"]})
+    return {"user": user}
+
+
+@app.patch("/api/admin/users/{user_id}/role")
+def update_user_role(user_id: str, req: RoleUpdateRequest, request: Request):
+    try:
+        user = change_account_role(user_id, req.role)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    write_audit_event("role_changed", request.state.user, user["email"], {"new_role": user["role"]})
+    return {"user": user}
+
+
+@app.get("/api/admin/audit")
+def get_admin_audit(limit: int = Query(200, ge=1, le=500)):
+    return {"events": list_audit_events(limit)}
 
 
 @app.post("/api/upload")
@@ -417,6 +658,22 @@ def get_time_range():
     }
 
 
+@app.get("/api/baseline")
+def get_baseline():
+    if state.baseline is None:
+        return {"available": False, "baseline_summary": None}
+    return {
+        "available": True,
+        "baseline_summary": {
+            "learning_start": state.baseline["learning_start"],
+            "learning_end": state.baseline["learning_end"],
+            "learning_records_count": state.baseline["learning_records_count"],
+            "hosts_profiled_count": state.baseline["hosts_profiled_count"],
+            "created_at": state.baseline["created_at"]
+        }
+    }
+
+
 @app.post("/api/baseline/build")
 def build_baseline(req: BaselineRequest):
     """Builds historical normal behavioral baseline for hosts."""
@@ -569,12 +826,42 @@ def get_traffic_analytics(interval: int = Query(5, description="Interval in minu
     traffic = get_traffic_over_time(state.clean_df, interval_minutes=interval)
     protocols = get_protocol_distribution(state.clean_df)
     talkers = get_top_talkers(state.clean_df, limit=10)
+    bucket_findings: Dict[str, List[Dict[str, Any]]] = {}
+    for finding in state.findings:
+        try:
+            bucket_time = pd.to_datetime(finding["timestamp"]).floor(f"{interval}min")
+        except (KeyError, TypeError, ValueError):
+            continue
+        bucket_key = str(bucket_time)
+        bucket_findings.setdefault(bucket_key, []).append(finding)
+
+    for bucket in traffic:
+        matching_findings = bucket_findings.get(bucket["timestamp"], [])
+        bucket["anomaly_count"] = sum(not finding.get("is_suppressed", False) for finding in matching_findings)
+        bucket["approved_activity_count"] = sum(finding.get("is_suppressed", False) for finding in matching_findings)
+        bucket["anomaly_rules"] = sorted({finding.get("rule_name", "Anomaly") for finding in matching_findings})
 
     return {
         "interval_minutes": interval,
         "time_series": traffic,
         "protocols": protocols,
-        "top_talkers": talkers
+        "top_talkers": talkers,
+        "anomaly_markers": [
+            {
+                "timestamp": finding.get("timestamp"),
+                "finding_id": finding.get("finding_id"),
+                "rule_id": finding.get("rule_id"),
+                "rule_name": finding.get("rule_name"),
+                "affected_host": finding.get("affected_host"),
+                "observed_value": finding.get("observed_value"),
+                "baseline_threshold": finding.get("baseline_threshold"),
+                "explanation": finding.get("explanation"),
+                "risk_score": finding.get("risk_score"),
+                "is_suppressed": finding.get("is_suppressed", False),
+                "suppression_reason": finding.get("suppression_reason")
+            }
+            for finding in state.findings
+        ]
     }
 
 
@@ -592,7 +879,15 @@ def get_individual_host_analysis(host_ip: str):
     if state.clean_df is None or state.clean_df.empty:
         raise HTTPException(status_code=400, detail="No dataset loaded")
 
-    result = get_host_analysis(state.clean_df, host_ip, state.baseline, state.incidents)
+    observed_df = state.clean_df
+    if state.eval_start and state.eval_end:
+        observed_df = state.clean_df[
+            (state.clean_df["timestamp"] >= pd.to_datetime(state.eval_start))
+            & (state.clean_df["timestamp"] <= pd.to_datetime(state.eval_end))
+        ].copy()
+    result = get_host_analysis(
+        state.clean_df, host_ip, state.baseline, state.incidents, observed_df
+    )
     return result
 
 
@@ -625,22 +920,39 @@ def get_network_graph():
 
 @app.get("/api/incidents")
 def get_incidents_list(severity: Optional[str] = Query(None)):
-    if not state.incidents:
-        return {"incidents": []}
-
+    incidents = state.incidents
     if severity:
-        filtered = [inc for inc in state.incidents if inc.get("severity") == severity]
-        return {"incidents": filtered}
-
-    return {"incidents": state.incidents}
+        incidents = [inc for inc in incidents if inc.get("severity") == severity]
+    return {
+        "incidents": [
+            {**incident, "status": state.incident_status.get(incident["incident_id"], "open")}
+            for incident in incidents
+        ]
+    }
 
 
 @app.get("/api/incidents/{incident_id}")
 def get_incident_detail(incident_id: str):
     for inc in state.incidents:
         if inc["incident_id"] == incident_id:
-            return inc
+            return {**inc, "status": state.incident_status.get(incident_id, "open")}
     raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+
+
+@app.patch("/api/incidents/{incident_id}/status")
+def update_incident_status(incident_id: str, req: IncidentStatusRequest, request: Request):
+    if req.status not in {"open", "acknowledged", "resolved"}:
+        raise HTTPException(status_code=400, detail="Status must be open, acknowledged, or resolved")
+    if not any(incident["incident_id"] == incident_id for incident in state.incidents):
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    state.incident_status[incident_id] = req.status
+    write_audit_event(
+        "incident_status_changed",
+        request.state.user,
+        incident_id,
+        {"status": req.status}
+    )
+    return {"incident_id": incident_id, "status": req.status}
 
 
 @app.get("/api/incidents/{incident_id}/evidence")
@@ -671,6 +983,20 @@ def get_incident_evidence(incident_id: str):
     }
 
 
+@app.get("/api/incidents/{incident_id}/graph")
+def get_incident_graph(incident_id: str):
+    incident = next((item for item in state.incidents if item["incident_id"] == incident_id), None)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    if state.clean_df is None or state.clean_df.empty:
+        return {"incident_id": incident_id, "elements": {"nodes": [], "edges": []}, "summary": {}}
+
+    evidence_ids = set(incident.get("supporting_record_ids", []))
+    evidence_df = state.clean_df[state.clean_df["record_id"].isin(evidence_ids)].copy()
+    graph = build_network_graph(evidence_df, [incident], max_edges=max(len(evidence_df), 1))
+    return {"incident_id": incident_id, **graph}
+
+
 @app.get("/api/findings")
 def get_findings_list(host: Optional[str] = Query(None)):
     if host:
@@ -689,6 +1015,209 @@ def update_configuration(new_settings: Dict[str, Any]):
     if not success:
         raise HTTPException(status_code=400, detail=msg)
     return {"success": True, "message": msg, "settings": new_settings}
+
+
+QUALCOMM_DEFAULT_MODEL = "ai-hub-models/Qwen3-4B-Instruct-2507"
+
+
+def _qualcomm_runtime_settings() -> Dict[str, str]:
+    return {
+        "base_url": os.getenv("QUALCOMM_GENIEX_BASE_URL", "").strip().rstrip("/"),
+        "model": os.getenv("QUALCOMM_GENIEX_MODEL", QUALCOMM_DEFAULT_MODEL).strip(),
+        "api_key": os.getenv("QUALCOMM_GENIEX_API_KEY", "").strip()
+    }
+
+
+def _verified_incident_analysis(incident: Dict[str, Any]) -> Dict[str, Any]:
+    findings = incident.get("findings", [])
+    expected_record_ids = set(incident.get("supporting_record_ids", []))
+    if state.clean_df is None:
+        evidence_df = pd.DataFrame()
+    else:
+        evidence_df = state.clean_df[state.clean_df["record_id"].isin(expected_record_ids)].copy()
+
+    found_record_ids = set(evidence_df["record_id"].tolist()) if not evidence_df.empty else set()
+    evidence_rows = evidence_df.head(50).to_dict(orient="records")
+    for row in evidence_rows:
+        if pd.notna(row.get("timestamp")):
+            row["timestamp"] = str(row["timestamp"])
+
+    breakdown = incident.get("score_breakdown", {})
+    component_points = breakdown.get("component_points", {})
+    raw_points = sum(float(value) for value in component_points.values())
+    trust_multiplier = float(breakdown.get("trusted_activity_multiplier", 1.0))
+    recomputed_score = int(round(min(100.0, max(0.0, raw_points * trust_multiplier))))
+    finding_rule_ids = {finding.get("rule_id") for finding in findings}
+    contributing_rule_ids = {
+        rule.get("rule_id") for rule in incident.get("contributing_rules", [])
+    }
+    related_hosts = set(incident.get("affected_hosts", []))
+    suppressed_host_findings = [
+        finding for finding in state.findings
+        if finding.get("affected_host") in related_hosts and finding.get("is_suppressed")
+    ]
+
+    checks = {
+        "risk_score_matches_breakdown": recomputed_score == incident.get("score"),
+        "supporting_records_present": expected_record_ids.issubset(found_record_ids),
+        "contributing_rules_have_findings": contributing_rule_ids.issubset(finding_rule_ids)
+    }
+    checks["overall"] = "verified" if all(checks.values()) else "review_required"
+
+    return {
+        "incident_id": incident["incident_id"],
+        "risk_assessment": {
+            "score": incident.get("score"),
+            "severity": incident.get("severity"),
+            "explanation": incident.get("score_explanation"),
+            "score_breakdown": breakdown,
+            "contributing_rules": incident.get("contributing_rules", [])
+        },
+        "triggered_rules": [
+            {
+                "finding_id": finding.get("finding_id"),
+                "rule_id": finding.get("rule_id"),
+                "rule_name": finding.get("rule_name"),
+                "severity": finding.get("severity"),
+                "observed_value": finding.get("observed_value"),
+                "baseline_threshold": finding.get("baseline_threshold"),
+                "explanation": finding.get("explanation"),
+                "supporting_record_ids": finding.get("supporting_record_ids", [])
+            }
+            for finding in findings
+        ],
+        "evidence": {
+            "expected_record_count": len(expected_record_ids),
+            "returned_record_count": len(found_record_ids),
+            "records": evidence_rows
+        },
+        "validation": {
+            "checks": checks,
+            "suppressed_activity_for_affected_hosts": [
+                {
+                    "finding_id": finding.get("finding_id"),
+                    "rule_name": finding.get("rule_name"),
+                    "reason": finding.get("suppression_reason")
+                }
+                for finding in suppressed_host_findings
+            ],
+            "summary": (
+                "Risk score, rules, and evidence were cross-checked against the active dataset."
+                if checks["overall"] == "verified"
+                else "One or more verification checks did not reconcile with the active dataset."
+            )
+        }
+    }
+
+
+async def _qualcomm_runtime_status(runtime: Dict[str, str]) -> Dict[str, str]:
+    base_url = runtime["base_url"]
+    if not base_url:
+        return {"status": "pending", "message": "GenieX is not configured. Verified NetWatch results are available below."}
+
+    parsed_url = urlsplit(base_url)
+    if (
+        parsed_url.scheme != "http"
+        or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        return {"status": "unavailable", "message": "Only a loopback GenieX server is supported; remote inference endpoints are disabled."}
+
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{base_url}/models")
+        response.raise_for_status()
+        available_models = {
+            item.get("id") for item in response.json().get("data", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        if available_models and runtime["model"] not in available_models:
+            return {"status": "unavailable", "message": f"GenieX is running but model {runtime['model']} is not loaded."}
+        return {"status": "available", "message": "Local GenieX runtime and configured model are available."}
+    except Exception:
+        return {"status": "unavailable", "message": "Could not connect to the configured local GenieX runtime."}
+
+
+def _qualcomm_response(incident: Dict[str, Any], runtime_status: Dict[str, str], runtime: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        "provider": "Qualcomm AI Hub / GenieX",
+        "model": runtime["model"],
+        "integration_status": runtime_status["status"],
+        "status_message": runtime_status["message"],
+        "ai_assessment": None,
+        "model_confidence": None,
+        "confidence_note": "GenieX chat responses do not provide a calibrated confidence score.",
+        "verified_analysis": _verified_incident_analysis(incident)
+    }
+
+
+@app.get("/api/incidents/{incident_id}/qualcomm-analysis")
+async def get_qualcomm_incident_analysis(incident_id: str):
+    incident = next((item for item in state.incidents if item["incident_id"] == incident_id), None)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    runtime = _qualcomm_runtime_settings()
+    status = await _qualcomm_runtime_status(runtime)
+    return _qualcomm_response(incident, status, runtime)
+
+
+@app.post("/api/incidents/{incident_id}/qualcomm-analysis")
+async def run_qualcomm_incident_analysis(incident_id: str):
+    incident = next((item for item in state.incidents if item["incident_id"] == incident_id), None)
+    if incident is None:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+    runtime = _qualcomm_runtime_settings()
+    status = await _qualcomm_runtime_status(runtime)
+    result = _qualcomm_response(incident, status, runtime)
+    if status["status"] != "available":
+        return result
+
+    verified = result["verified_analysis"]
+    evidence_facts = {
+        "risk_assessment": verified["risk_assessment"],
+        "triggered_rules": verified["triggered_rules"],
+        "supporting_flow_records": verified["evidence"]["records"][:20],
+        "deterministic_validation": verified["validation"]["checks"]
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Assist a network security analyst using only the supplied verified NetWatch evidence. "
+                "Distinguish observed facts from hypotheses, discuss plausible false-positive explanations, "
+                "and recommend validation steps. Never change the deterministic risk score or claim confidence."
+            )
+        },
+        {"role": "user", "content": json.dumps(evidence_facts, default=str)}
+    ]
+    headers = {}
+    if runtime["api_key"]:
+        headers["Authorization"] = f"Bearer {runtime['api_key']}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                f"{runtime['base_url']}/chat/completions",
+                headers=headers,
+                json={
+                    "model": runtime["model"],
+                    "messages": messages,
+                    "max_tokens": 700,
+                    "temperature": 0.2,
+                    "stream": False,
+                    "enable_think": False
+                }
+            )
+        response.raise_for_status()
+        assessment = response.json().get("choices", [{}])[0].get("message", {}).get("content")
+        if not isinstance(assessment, str) or not assessment.strip():
+            raise ValueError("GenieX returned no assessment text")
+        result["ai_assessment"] = assessment.strip()
+        result["status_message"] = "Assessment generated by the configured local GenieX runtime."
+    except Exception:
+        result["integration_status"] = "unavailable"
+        result["status_message"] = "The GenieX request failed; verified NetWatch results remain available."
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -804,7 +1333,7 @@ def export_incidents_csv():
     writer = csv.writer(output)
     writer.writerow([
         "Incident ID", "Title", "Affected Hosts", "Destinations",
-        "Severity", "Score", "First Seen", "Last Seen",
+        "Severity", "Status", "Score", "First Seen", "Last Seen",
         "Related Rules", "Findings Count", "Is Approved"
     ])
 
@@ -815,6 +1344,7 @@ def export_incidents_csv():
             sanitize_csv_cell(", ".join(inc.get("affected_hosts", []))),
             sanitize_csv_cell(", ".join(inc.get("destinations", []))),
             sanitize_csv_cell(inc.get("severity")),
+            state.incident_status.get(inc["incident_id"], "open"),
             inc.get("score"),
             sanitize_csv_cell(inc.get("first_seen")),
             sanitize_csv_cell(inc.get("last_seen")),
@@ -1121,3 +1651,25 @@ def export_html_investigation_report():
         media_type="text/html",
         headers={"Content-Disposition": 'attachment; filename="netwatch_investigation_report.html"'}
     )
+
+
+FRONTEND_DIST_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist"
+)
+FRONTEND_INDEX = os.path.join(FRONTEND_DIST_DIR, "index.html")
+
+@app.get("/{frontend_path:path}", include_in_schema=False)
+def serve_frontend(frontend_path: str):
+    if frontend_path == "api" or frontend_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API endpoint not found")
+    if not os.path.isfile(FRONTEND_INDEX):
+        raise HTTPException(status_code=503, detail="Frontend application is not built")
+
+    requested_file = os.path.realpath(os.path.join(FRONTEND_DIST_DIR, frontend_path))
+    dist_root = os.path.realpath(FRONTEND_DIST_DIR)
+    if os.path.commonpath([dist_root, requested_file]) == dist_root and os.path.isfile(requested_file):
+        return FileResponse(requested_file)
+    if os.path.splitext(frontend_path)[1]:
+        raise HTTPException(status_code=404, detail="Frontend asset not found")
+
+    return FileResponse(FRONTEND_INDEX, headers={"Cache-Control": "no-cache"})

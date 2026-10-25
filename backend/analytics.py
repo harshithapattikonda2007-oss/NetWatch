@@ -115,7 +115,8 @@ def get_host_analysis(
     df: pd.DataFrame,
     host_ip: str,
     baseline: Optional[Dict[str, Any]] = None,
-    incidents: Optional[List[Dict[str, Any]]] = None
+    incidents: Optional[List[Dict[str, Any]]] = None,
+    observed_df: Optional[pd.DataFrame] = None
 ) -> Dict[str, Any]:
     """Provides complete deep-dive analysis for an individual host."""
     outgoing_flows = df[df["src_ip"] == host_ip].copy()
@@ -145,6 +146,68 @@ def get_host_analysis(
     host_base = None
     if baseline and "host_baselines" in baseline:
         host_base = baseline["host_baselines"].get(host_ip)
+
+    comparison = None
+    if host_base and baseline and observed_df is not None:
+        observed_outgoing = observed_df[observed_df["src_ip"] == host_ip]
+        learning_start = pd.to_datetime(baseline["learning_start"])
+        learning_end = pd.to_datetime(baseline["learning_end"])
+        learning_hours = max((learning_end - learning_start).total_seconds() / 3600, 1 / 3600)
+        if state_eval_start := observed_df["timestamp"].min():
+            observed_start = pd.to_datetime(state_eval_start)
+            observed_end = pd.to_datetime(observed_df["timestamp"].max())
+            observed_hours = max((observed_end - observed_start).total_seconds() / 3600, 1 / 3600)
+        else:
+            observed_start = observed_end = learning_start
+            observed_hours = learning_hours
+
+        observed_failures = int(observed_outgoing["action"].isin(
+            ["DENY", "DROP", "REJECT", "BLOCKED", "FAILED", "RESET"]
+        ).sum())
+        observed_connections = len(observed_outgoing)
+        observed_dest_count = int(observed_outgoing["dst_ip"].nunique())
+        observed_bytes_sent = float(observed_outgoing["bytes_sent"].sum())
+        normal_total_bytes = float(host_base.get("bytes_sent_mean", 0)) * int(host_base.get("conn_count", 0))
+        def comparison_metric(key: str, label: str, unit: str, normal: float, observed: float) -> Dict[str, Any]:
+            return {
+                "key": key,
+                "label": label,
+                "unit": unit,
+                "normal": round(normal, 2),
+                "observed": round(observed, 2),
+                "change_percent": round((observed - normal) / normal * 100, 2) if normal else None
+            }
+
+        comparison = {
+            "learning_window": f"{learning_start} to {learning_end}",
+            "evaluation_window": f"{observed_start} to {observed_end}",
+            "metrics": [
+                comparison_metric(
+                    "connections_per_hour", "Outgoing connections per hour", "/hour",
+                    host_base.get("conn_count", 0) / learning_hours,
+                    observed_connections / observed_hours
+                ),
+                comparison_metric(
+                    "bytes_sent_per_hour", "Bytes sent per hour", "B/hour",
+                    normal_total_bytes / learning_hours,
+                    observed_bytes_sent / observed_hours
+                ),
+                comparison_metric(
+                    "average_bytes_per_flow", "Average bytes sent per flow", "B/flow",
+                    float(host_base.get("bytes_sent_mean", 0)),
+                    observed_bytes_sent / observed_connections if observed_connections else 0
+                ),
+                comparison_metric(
+                    "distinct_destinations", "Distinct destinations", "hosts",
+                    host_base.get("distinct_dest_count", 0), observed_dest_count
+                ),
+                comparison_metric(
+                    "failed_rate", "Failed connection rate", "%",
+                    float(host_base.get("failed_rate", 0)) * 100,
+                    observed_failures / observed_connections * 100 if observed_connections else 0
+                )
+            ]
+        }
 
     # Associated incidents
     host_incidents = []
@@ -180,6 +243,7 @@ def get_host_analysis(
         "top_ports": top_ports,
         "protocols": protocols,
         "baseline_profile": host_base,
+        "behavior_comparison": comparison,
         "incidents": host_incidents,
         "evidence_flows": evidence_flows
     }
