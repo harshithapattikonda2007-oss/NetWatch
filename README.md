@@ -14,6 +14,47 @@ There are no built-in demo passwords. To provision an administrator on first sta
 
 ---
 
+## 🛠️ Technical Stack
+
+### 🎨 Frontend
+
+* **React.js** – Component-based user interface for the security dashboard.
+* **JavaScript (JSX)** – Frontend logic and interactive components.
+* **CSS3** – Styling and responsive dashboard design.
+* **Vite** – Frontend development server and build tool.
+
+### ⚙️ Backend
+
+* **Python** – Core processing and network anomaly detection logic.
+* **FastAPI** – REST API framework connecting the frontend with backend services.
+
+### 🔍 Detection & Analysis
+
+* **Rule-Based Detection Engine** – Identifies suspicious network activity using configurable detection rules.
+* **Behavioral Baselines** – Helps identify deviations from typical network traffic patterns.
+* **YAML** – Configuration of detection rules, thresholds, and approved activities.
+* **Python Data Processing** – Parses and analyzes uploaded network-flow datasets.
+
+### 📊 Visualization
+
+* **Cytoscape.js** – Visualizes network relationships and traffic connections.
+* **Dashboard Charts** – Presents traffic statistics, anomalies, and investigation findings.
+
+### 🤖 AI Integration
+
+* **Ollama (Optional)** – Supports local AI-assisted security incident assessment without requiring a cloud-based AI API.
+
+### 🧪 Testing
+
+* **Pytest** – Tests backend functionality and detection logic.
+
+### 📁 Data & Reporting
+
+* **CSV** – Input format for network-flow datasets and exported analysis results.
+* **HTML** – Generates readable forensic and investigation reports.
+
+---
+
 ## Key Features
 
 1. **Local Processing & Privacy**: Complete local execution. No cloud API or remote telemetry required.
@@ -266,11 +307,6 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch
 .venv\Scripts\pytest backend\tests -v
 ```
 
-**Results (26/26 Passed)**:
-- `test_authentication_signup_login_and_protected_api` (Signed session cookies, protected APIs, and logout)
-- `test_role_permissions_enforced_for_admin_and_analyst` (Admin/analyst access and live role changes)
-- `test_demo_accounts_are_opt_in_and_environment_configured` (Environment-configured demo accounts and opt-in exposure)
-- `test_signup_rejects_weak_password` (Minimum password length)
 - `test_suggest_column_mapping` (Auto-aliasing of common flow headers)
 - `test_zeek_schema_maps_to_canonical_fields_and_matches_default` (Alternate field names normalize to the canonical flow schema)
 - `test_zeek_tsv_upload_auto_maps_columns` (Tab-delimited upload selects the configured schema profile)
@@ -298,3 +334,4 @@ cd c:\Users\harsh\OneDrive\Desktop\netwatch\frontend
 npm run build
 ```
 Builds cleanly with zero errors.
+
